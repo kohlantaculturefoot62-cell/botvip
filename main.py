@@ -206,62 +206,6 @@ async def run_daily_routine(dry_run: bool = False):
 
     print(f"==================== FIN ROUTINE MATINALE {mode} ====================\n")
 
-
-@bot.event
-async def on_message(message: discord.Message):
-    global last_clash_time
-
-    if message.author.bot or message.webhook_id or not message.guild:
-        return
-
-    # Détection uniquement sur le pseudo brut Discord (message.author.name)
-    if message.author.name.lower() == TARGET_USERNAME.lower():
-        now = time.time()
-        if now - last_clash_time > CLASH_COOLDOWN_SECONDS:
-            last_clash_time = now
-            print(f"\n[AUTO-CLASH] Message d'eleas6z détecté dans #{message.channel.name}")
-
-            # Historique avec uniquement les pseudos bruts (et 'Eleas' pour la cible)
-            raw_history = []
-            async for msg in message.channel.history(limit=20):
-                if msg.content.strip():
-                    sender = "Eleas" if msg.author.name.lower() == TARGET_USERNAME.lower() else msg.author.name
-                    raw_history.append(f"{sender}: {msg.content.strip()}")
-
-            raw_history.reverse()
-            recent_context = "\n".join(raw_history)
-
-            self_roast = generate_instant_self_roast(recent_context)
-
-            sent_via_webhook = False
-            try:
-                webhooks = await message.channel.webhooks()
-                webhook = discord.utils.get(webhooks, name="MirrorBot")
-                if not webhook:
-                    webhook = await message.channel.create_webhook(name="MirrorBot")
-
-                avatar_url = message.author.display_avatar.url
-
-                await webhook.send(
-                    content=self_roast,
-                    username="Eleas (le vrai)",
-                    avatar_url=avatar_url
-                )
-                sent_via_webhook = True
-                print(f"[AUTO-CLASH WEBHOOK] Posté sous 'Eleas (le vrai)' : {self_roast}")
-            except Exception as e:
-                print(f"Webhook indisponible (vérifier permission Manage Webhooks) : {e}")
-
-            if not sent_via_webhook:
-                try:
-                    await message.reply(f"*Eleas :*\n« {self_roast} »")
-                    print(f"[AUTO-CLASH REPLY] : {self_roast}")
-                except Exception as e:
-                    print(f"Erreur envoi auto-clash : {e}")
-
-    await bot.process_commands(message)
-
-
 @bot.event
 async def on_ready():
     print(f"Bot connecté en tant que : {bot.user.name} ({bot.user.id})")
