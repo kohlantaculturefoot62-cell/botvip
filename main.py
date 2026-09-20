@@ -26,9 +26,10 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 scheduler = AsyncIOScheduler()
 
+# Cible exacte sur le pseudo brut Discord
 TARGET_USERNAME = "eleas6z"
 last_clash_time = 0
-CLASH_COOLDOWN_SECONDS = 120  # Délai anti-spam entre deux auto-clashs
+CLASH_COOLDOWN_SECONDS = 120  # Cooldown anti-mitraillage
 
 
 async def get_recent_user_activity(guild: discord.Guild, user_id: int) -> str:
@@ -124,11 +125,11 @@ Consignes :
         return "Passe une excellente journée pleine d'énergie !" if not is_victim else "C'est tombé sur toi ce matin... fais un effort aujourd'hui !"
 
 
-def generate_instant_self_roast(target_name: str, recent_chat: str) -> str:
-    """Génère un auto-clash où l'utilisateur tacle son propre message via Gemini 3.5."""
+def generate_instant_self_roast(recent_chat: str) -> str:
+    """Génère un auto-clash où Eleas tacle son propre message via Gemini 3.5."""
     prompt = f"""
-Tu dois écrire un message à la première personne ("Je" / "Moi"), en te faisant passer pour '{target_name}'.
-Tu viens d'envoyer un message sur le serveur Discord, mais tu te rends soudainement compte du vide sidéral ou de la gêne de ton intervention par rapport à la conversation.
+Tu dois écrire un message à la première personne ("Je" / "Moi"), en te faisant passer pour Eleas.
+Eleas vient d'envoyer un message sur le serveur Discord, mais il se rend soudainement compte du vide sidéral ou de la gêne de son intervention par rapport à la conversation.
 
 Voici les 20 derniers messages du salon (le tout dernier est celui que tu viens d'écrire) :
 ---
@@ -137,10 +138,11 @@ Voici les 20 derniers messages du salon (le tout dernier est celui que tu viens 
 
 Consignes STRICTES :
 - Parle à la première personne ("Je", "J'avoue", "En vrai je...", "Pourquoi j'ai dit ça ?").
-- Auto-clashe-toi avec beaucoup de lucidité et d'autodérision : reconnais que ton intervention n'avait aucun sens, que tu forces, ou que tu aurais mieux fait de garder le silence.
+- Tu t'appelles Eleas. Ne fais JAMAIS référence à un autre nom ou surnom d'apparat.
+- Auto-clashe-toi avec beaucoup de lucidité et d'autodérision : reconnais que ton intervention n'avait aucun sens, que tu forces, ou que tu aurais mieux fait de te taire.
 - Fais référence DIRECTE à ce que tu viens de poster et au sujet de la discussion.
 - Reste court et percutant (1 à 2 phrases max, style message Discord rapide).
-- Pas de guillemets, pas de préambule, uniquement le message comme si {target_name} l'envoyait lui-même.
+- Pas de guillemets, pas de préambule, uniquement le message comme si Eleas l'envoyait lui-même.
 """
 
     try:
@@ -169,7 +171,7 @@ async def run_daily_routine(dry_run: bool = False):
         return
 
     victim = random.choice(members)
-    print(f"🎯 Victime sélectionnée : {victim.display_name} (@{victim.name})\n")
+    print(f"🎯 Victime sélectionnée : {victim.name}\n")
 
     for member in members:
         is_victim = (member.id == victim.id)
@@ -177,10 +179,12 @@ async def run_daily_routine(dry_run: bool = False):
 
         context = await get_recent_user_activity(guild, member.id)
         nb_messages = len(context.splitlines()) if "Aucun message" not in context else 0
-        print(f"👤 Membre : {member.display_name} (@{member.name}) | Rôle : {role_label}")
+        print(f"👤 Membre : {member.name} | Rôle : {role_label}")
         print(f"   ↳ Messages analysés : {nb_messages}")
 
-        generated_text = generate_morning_text(member.display_name, context, is_victim)
+        # On utilise le pseudo brut member.name (pas le display_name)
+        target_display = "Eleas" if member.name.lower() == TARGET_USERNAME.lower() else member.name
+        generated_text = generate_morning_text(target_display, context, is_victim)
         prefix = "💥 **Le tacle du matin :**\n" if is_victim else "☀️ **Bonjour !**\n"
         full_message = f"{prefix}{generated_text}"
 
@@ -210,26 +214,24 @@ async def on_message(message: discord.Message):
     if message.author.bot or message.webhook_id or not message.guild:
         return
 
-    author_matches = (
-        message.author.name.lower() == TARGET_USERNAME.lower() or
-        message.author.display_name.lower() == TARGET_USERNAME.lower()
-    )
-
-    if author_matches:
+    # Détection uniquement sur le pseudo brut Discord (message.author.name)
+    if message.author.name.lower() == TARGET_USERNAME.lower():
         now = time.time()
         if now - last_clash_time > CLASH_COOLDOWN_SECONDS:
             last_clash_time = now
             print(f"\n[AUTO-CLASH] Message d'eleas6z détecté dans #{message.channel.name}")
 
+            # Historique avec uniquement les pseudos bruts (et 'Eleas' pour la cible)
             raw_history = []
             async for msg in message.channel.history(limit=20):
                 if msg.content.strip():
-                    raw_history.append(f"{msg.author.display_name}: {msg.content.strip()}")
+                    sender = "Eleas" if msg.author.name.lower() == TARGET_USERNAME.lower() else msg.author.name
+                    raw_history.append(f"{sender}: {msg.content.strip()}")
 
             raw_history.reverse()
             recent_context = "\n".join(raw_history)
 
-            self_roast = generate_instant_self_roast(message.author.display_name, recent_context)
+            self_roast = generate_instant_self_roast(recent_context)
 
             sent_via_webhook = False
             try:
@@ -242,17 +244,17 @@ async def on_message(message: discord.Message):
 
                 await webhook.send(
                     content=self_roast,
-                    username=f"{message.author.display_name} (le vrai)",
+                    username="Eleas (le vrai)",
                     avatar_url=avatar_url
                 )
                 sent_via_webhook = True
-                print(f"[AUTO-CLASH WEBHOOK] Posté sous l'identité clone : {self_roast}")
+                print(f"[AUTO-CLASH WEBHOOK] Posté sous 'Eleas (le vrai)' : {self_roast}")
             except Exception as e:
                 print(f"Webhook indisponible (vérifier permission Manage Webhooks) : {e}")
 
             if not sent_via_webhook:
                 try:
-                    await message.reply(f"*Auto-lucidité activée :*\n« {self_roast} »")
+                    await message.reply(f"*Eleas :*\n« {self_roast} »")
                     print(f"[AUTO-CLASH REPLY] : {self_roast}")
                 except Exception as e:
                     print(f"Erreur envoi auto-clash : {e}")
