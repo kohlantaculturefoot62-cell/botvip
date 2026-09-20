@@ -29,7 +29,7 @@ scheduler = AsyncIOScheduler()
 # Cible exacte sur le pseudo brut Discord
 TARGET_USERNAME = "eleas6z"
 last_clash_time = 0
-CLASH_COOLDOWN_SECONDS = 10  # Cooldown anti-mitraillage
+CLASH_COOLDOWN_SECONDS = 3600  # Cooldown anti-mitraillage
 
 
 async def get_recent_user_activity(guild: discord.Guild, user_id: int) -> str:
