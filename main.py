@@ -53,36 +53,64 @@ async def get_recent_user_activity(guild: discord.Guild, user_id: int) -> str:
     return "\n".join([f"- {m}" for m in collected_messages])
 
 
+import random
+
 def generate_morning_text(username: str, context: str, is_victim: bool) -> str:
-    """Génère un compliment ou un clash personnalisé via Gemini 3.5."""
+    """Génère un compliment ou un clash développé avec un style aléatoire pour surprendre."""
+    
+    # Styles variés pour les compliments
+    sweet_styles = [
+        "coach de vie surmotivé façon TED Talk, mais avec un second degré bienveillant",
+        "pote sincère qui pose les termes et prend le temps d'envoyer de la vraie bonne énergie",
+        "observateur décalé qui fait une analyse psychologique élogieuse basée sur ses messages",
+        "poète moderne du quotidien, mi-philosophique mi-drôle",
+        "discours d'avant-match de vestiaire pour chauffer la personne avant sa journée"
+    ]
+
+    # Styles variés pour les clashs
+    roast_styles = [
+        "chroniqueur satirique impitoyable mais hilarant qui décortique son comportement",
+        "pote dépité qui remet gentiment les pendules à l'heure avec beaucoup d'ironie",
+        "enquêteur qui a analysé ses messages et en tire des conclusions désastreuses",
+        "critique gastronomique/littéraire qui note très sévèrement la prestation de la personne sur le serveur",
+        "discours faussement solennel pour lui décerner la palme de la flemme ou du flop"
+    ]
+
+    chosen_style = random.choice(roast_styles if is_victim else sweet_styles)
+
     if is_victim:
         prompt = f"""
-Tu es un pote taquin et sarcastique sur un serveur Discord. Tu dois tacler avec humour '{username}'.
-Voici ses derniers messages sur le serveur :
+Tu es un pote sur un serveur Discord. Tu dois rédiger le tacle du matin destiné à '{username}'.
+Voici ses derniers messages sur le serveur pour t'inspirer de son attitude, ses expressions ou ses délires :
 ---
 {context}
 ---
 
-Consignes STRICTES :
-- Fais un clash court (2 phrases max) qui fait DIRECTEMENT référence à ce qu'il/elle a dit ou à ses habitudes.
-- Si le contexte indique qu'il n'a pas parlé, clashe-le sur le fait qu'il est un fantôme / un sous-marin qui ne sert à rien sur le serveur.
-- Reste bon enfant, pas d'insultes graves ni de haine.
-- Réponds UNIQUEMENT le clash, sans guillemets ni introduction.
+Ton angle d'attaque du jour : adoptera un ton de **{chosen_style}**.
+
+Consignes :
+- Développe un message consistant et bien écrit (3 à 5 phrases, environ 50 à 90 mots). Ne sois pas trop bref, prends le temps de bien poser la vanne.
+- Fais des références précises à ses messages récents ou à sa manière de s'exprimer sur le serveur.
+- Si le contexte indique qu'il/elle n'a pas parlé, clashe-le/la longuement sur son statut de fantôme ou de spectateur passif de la vie du serveur.
+- Reste dans le chambrage entre potes : drôle, créatif, piquant mais sans haine ni vulgarité gratuite.
+- Réponds UNIQUEMENT le texte du message, sans guillemets, sans titre.
 """
     else:
         prompt = f"""
-Tu es un pote bienveillant sur un serveur Discord. Tu dois donner de la force et souhaiter une bonne journée à '{username}'.
+Tu es un ami proche et chaleureux sur un serveur Discord. Tu dois rédiger un mot doux / message d'encouragement matinal personnalisé pour '{username}'.
 Voici ses derniers messages sur le serveur :
 ---
 {context}
 ---
 
-Consignes STRICTES :
-- Fais un message motivant et sympa de 2 phrases max.
-- Fais une référence directe ou subtile à ses discussions récentes ou ses centres d'intérêt.
-- Si le contexte indique qu'il n'a pas parlé, dis-lui qu'on aimerait bien le voir parler un peu plus aujourd'hui.
-- Ne sois pas un robot : parle comme un humain sur Discord.
-- Réponds UNIQUEMENT le message, sans guillemets ni introduction.
+Ton style du jour : adopte un ton de **{chosen_style}**.
+
+Consignes :
+- Écris un texte riche, vivant et sympa (3 à 5 phrases, environ 50 à 90 mots). Ne fais pas un message expéditif de deux lignes.
+- Inspire-toi réellement de ce qu'il/elle raconte, de ses passions ou de son humeur pour que la personne sente que c'est du 100% sur-mesure.
+- Si le contexte indique qu'il/elle n'a pas beaucoup parlé récemment, dis-lui avec humour et bienveillance qu'il/elle manque aux discussions du serveur.
+- Sois naturel, évite le ton robotique ou corpo : parle comme quelqu'un qui écrit un super message à un pote sur Discord.
+- Réponds UNIQUEMENT le texte du message, sans guillemets, sans titre.
 """
 
     try:
@@ -93,8 +121,11 @@ Consignes STRICTES :
         return response.text.strip()
     except Exception as e:
         print(f"Erreur API Gemini pour {username}: {e}")
-        return "Passe une excellente journée !" if not is_victim else "C'est tombé sur toi ce matin... fais un effort aujourd'hui !"
-
+        return (
+            "Passe une excellente journée ! Prends le temps de faire les choses bien aujourd'hui et n'oublie pas de t'hydrater, force pour tout ce qui t'attend !"
+            if not is_victim
+            else "C'est tombé sur toi ce matin... Honnêtement, regarde tes derniers messages, c'était écrit d'avance. Fais un effort aujourd'hui et essaie de relever le niveau !"
+        )
 
 async def run_daily_routine(dry_run: bool = False):
     mode = "[MODE SIMULATION / AUCUN ENVOI]" if dry_run else "[MODE RÉEL / ENVOI DM]"
