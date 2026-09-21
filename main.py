@@ -1,7 +1,6 @@
 import os
 import asyncio
 import random
-import time
 from dotenv import load_dotenv
 import discord
 from discord import app_commands
@@ -26,15 +25,15 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 scheduler = AsyncIOScheduler()
 
-# Cible exacte sur le pseudo brut Discord
-TARGET_USERNAME = "eleas6z"
-last_clash_time = 0
-CLASH_COOLDOWN_SECONDS = 3600  # Cooldown anti-mitraillage
 
-
-async def get_recent_user_activity(guild: discord.Guild, user_id: int) -> str:
-    """Scanne les salons pour extraire les messages récents d'un membre."""
-    collected_messages = []
+async def get_comprehensive_user_context(guild: discord.Guild, member: discord.Member) -> str:
+    """
+    Récupère :
+    1. Ce que la personne écrit (pour capter ses délires et sujets récents).
+    2. Ce que les autres lui disent (pour déduire le genre et les accords).
+    """
+    user_messages = []
+    mentions_and_replies = []
 
     for channel in guild.text_channels:
         perms = channel.permissions_for(guild.me)
@@ -43,24 +42,40 @@ async def get_recent_user_activity(guild: discord.Guild, user_id: int) -> str:
 
         try:
             async for msg in channel.history(limit=100):
-                if msg.author.id == user_id and msg.content.strip():
-                    collected_messages.append(msg.content.strip())
-                    if len(collected_messages) >= 10:
-                        break
+                content = msg.content.strip()
+                if not content:
+                    continue
+
+                # Messages écrits par le membre
+                if msg.author.id == member.id and len(user_messages) < 10:
+                    user_messages.append(f"- {content}")
+
+                # Messages des autres qui le mentionnent ou lui répondent
+                elif (member.mentioned_in(msg) or str(member.id) in msg.content) and len(mentions_and_replies) < 6:
+                    mentions_and_replies.append(f"- {msg.author.display_name} a dit : \"{content}\"")
+
+                if len(user_messages) >= 10 and len(mentions_and_replies) >= 6:
+                    break
         except Exception:
             continue
 
-        if len(collected_messages) >= 10:
+        if len(user_messages) >= 10 and len(mentions_and_replies) >= 6:
             break
 
-    if not collected_messages:
-        return "Aucun message récent trouvé dans les salons accessibles."
+    context_parts = []
+    if user_messages:
+        context_parts.append("Messages récents postés par cette personne :\n" + "\n".join(user_messages))
+    else:
+        context_parts.append("Cette personne n'a presque rien posté récemment (membre silencieux).")
 
-    return "\n".join([f"- {m}" for m in collected_messages])
+    if mentions_and_replies:
+        context_parts.append("\nMessages où les autres membres lui parlent ou la mentionnent :\n" + "\n".join(mentions_and_replies))
+
+    return "\n".join(context_parts)
 
 
-def generate_morning_text(username: str, context: str, is_victim: bool) -> str:
-    """Génère un message matinal développé avec alternance de styles via Gemini 3.5."""
+def generate_morning_text(display_name: str, context: str, is_victim: bool) -> str:
+    """Génère le texte du matin avec le display_name et déduction automatique du genre."""
     sweet_styles = [
         "coach de vie surmotivé façon TED Talk, mais avec un second degré bienveillant",
         "pote sincère qui pose les termes et prend le temps d'envoyer de la vraie bonne énergie",
@@ -79,38 +94,44 @@ def generate_morning_text(username: str, context: str, is_victim: bool) -> str:
 
     chosen_style = random.choice(roast_styles if is_victim else sweet_styles)
 
-    if is_victim:
-        prompt = f"""
-Tu es un pote sur un serveur Discord. Tu dois rédiger le tacle du matin destiné à '{username}'.
-Voici ses derniers messages sur le serveur pour t'inspirer de son attitude, ses expressions ou ses délires :
+    common_instructions = f"""
+Prénom / Nom d'appel à utiliser impérativement : '{display_name}'.
+Voici le contexte des discussions sur le serveur :
 ---
 {context}
 ---
+
+CONSIGNES SUR L'IDENTITÉ ET LE GENRE :
+1. Nom d'appel : Appelle la personne UNIQUEMENT par son nom d'affichage '{display_name}'. N'invente pas d'autre nom.
+2. Genre et accords : Analyse les messages pour déduire si '{display_name}' est un homme ou une femme (regarde les adjectifs employés par les autres ou par la personne elle-même). Accorde TOUS tes adjectifs et participes passés en conséquence (ex: 'prêt/prête', 'fatigué/fatiguée', 'motivé/motivée'). Si c'est ambigu, privilégie des tournures neutres ou masculines par défaut.
+"""
+
+    if is_victim:
+        prompt = f"""
+Tu es un pote sur un serveur Discord. Tu dois rédiger le tacle du matin destiné à '{display_name}'.
+{common_instructions}
 
 Ton angle d'attaque du jour : adopte un ton de **{chosen_style}**.
 
 Consignes :
-- Développe un message consistant et bien écrit (3 à 5 phrases, environ 50 à 90 mots). Ne sois pas trop bref, prends le temps de bien poser la vanne.
-- Fais des références précises à ses messages récents ou à sa manière de s'exprimer sur le serveur.
-- Si le contexte indique qu'il/elle n'a pas parlé, clashe-le/la longuement sur son statut de fantôme ou de spectateur passif de la vie du serveur.
-- Reste dans le chambrage entre potes : drôle, créatif, piquant mais sans haine ni vulgarité gratuite.
+- Développe un message consistant et bien écrit (3 à 5 phrases, environ 50 à 90 mots). Ne sois pas trop bref, pose bien la vanne.
+- Fais des références précises à ses messages récents ou à sa manière de s'exprimer.
+- Si le contexte indique qu'il/elle n'a pas parlé, clashe-le/la sur son statut de fantôme passif sur le serveur.
+- Reste dans le chambrage entre potes : drôle, piquant, mais sans haine ni vulgarité gratuite.
 - Réponds UNIQUEMENT le texte du message, sans guillemets, sans titre.
 """
     else:
         prompt = f"""
-Tu es un ami proche et chaleureux sur un serveur Discord. Tu dois rédiger un mot doux / message d'encouragement matinal personnalisé pour '{username}'.
-Voici ses derniers messages sur le serveur :
----
-{context}
----
+Tu es un ami proche et chaleureux sur un serveur Discord. Tu dois rédiger un mot doux / message d'encouragement matinal personnalisé pour '{display_name}'.
+{common_instructions}
 
 Ton style du jour : adopte un ton de **{chosen_style}**.
 
 Consignes :
 - Écris un texte riche, vivant et sympa (3 à 5 phrases, environ 50 à 90 mots). Ne fais pas un message expéditif de deux lignes.
-- Inspire-toi réellement de ce qu'il/elle raconte, de ses passions ou de son humeur pour que la personne sente que c'est du 100% sur-mesure.
-- Si le contexte indique qu'il/elle n'a pas beaucoup parlé récemment, dis-lui avec humour et bienveillance qu'il/elle manque aux discussions du serveur.
-- Sois naturel, évite le ton robotique : parle comme un pote sur Discord.
+- Inspire-toi réellement de ce qu'il/elle raconte ou de ses passions pour que ce soit du sur-mesure.
+- Si le contexte indique qu'il/elle n'a pas beaucoup parlé récemment, dis-lui avec humour et bienveillance qu'il/elle manque aux discussions.
+- Sois naturel, évite le ton robotique ou corporate.
 - Réponds UNIQUEMENT le texte du message, sans guillemets, sans titre.
 """
 
@@ -121,39 +142,8 @@ Consignes :
         )
         return response.text.strip()
     except Exception as e:
-        print(f"Erreur API Gemini pour {username}: {e}")
+        print(f"Erreur API Gemini pour {display_name}: {e}")
         return "Passe une excellente journée pleine d'énergie !" if not is_victim else "C'est tombé sur toi ce matin... fais un effort aujourd'hui !"
-
-
-def generate_instant_self_roast(recent_chat: str) -> str:
-    """Génère un auto-clash où Eleas tacle son propre message via Gemini 3.5."""
-    prompt = f"""
-Tu dois écrire un message à la première personne ("Je" / "Moi"), en te faisant passer pour Eleas.
-Eleas vient d'envoyer un message sur le serveur Discord, mais il se rend soudainement compte du vide sidéral ou de la gêne de son intervention par rapport à la conversation.
-
-Voici les 20 derniers messages du salon (le tout dernier est celui que tu viens d'écrire) :
----
-{recent_chat}
----
-
-Consignes STRICTES :
-- Parle à la première personne ("Je", "J'avoue", "En vrai je...", "Pourquoi j'ai dit ça ?").
-- Tu t'appelles Eleas. Ne fais JAMAIS référence à un autre nom ou surnom d'apparat.
-- Auto-clashe-toi avec beaucoup de lucidité et d'autodérision : reconnais que ton intervention n'avait aucun sens, que tu forces, ou que tu aurais mieux fait de te taire.
-- Fais référence DIRECTE à ce que tu viens de poster et au sujet de la discussion.
-- Reste court et percutant (1 à 2 phrases max, style message Discord rapide).
-- Pas de guillemets, pas de préambule, uniquement le message comme si Eleas l'envoyait lui-même.
-"""
-
-    try:
-        response = ai_client.models.generate_content(
-            model="gemini-3.5-flash",
-            contents=prompt
-        )
-        return response.text.strip()
-    except Exception as e:
-        print(f"Erreur Gemini auto-clash : {e}")
-        return "En vrai je relis ce que je viens d'écrire et je devrais juste fermer Discord pour aujourd'hui..."
 
 
 async def run_daily_routine(dry_run: bool = False):
@@ -171,20 +161,18 @@ async def run_daily_routine(dry_run: bool = False):
         return
 
     victim = random.choice(members)
-    print(f"🎯 Victime sélectionnée : {victim.name}\n")
+    print(f"🎯 Victime sélectionnée : {victim.display_name} (@{victim.name})\n")
 
     for member in members:
         is_victim = (member.id == victim.id)
         role_label = "CLASH" if is_victim else "GENTIL"
 
-        context = await get_recent_user_activity(guild, member.id)
-        nb_messages = len(context.splitlines()) if "Aucun message" not in context else 0
-        print(f"👤 Membre : {member.name} | Rôle : {role_label}")
-        print(f"   ↳ Messages analysés : {nb_messages}")
+        # Contexte
+        context = await get_comprehensive_user_context(guild, member)
+        print(f"👤 Membre : {member.display_name} (@{member.name}) | Rôle : {role_label}")
 
-        # On utilise le pseudo brut member.name (pas le display_name)
-        target_display = "Eleas" if member.name.lower() == TARGET_USERNAME.lower() else member.name
-        generated_text = generate_morning_text(target_display, context, is_victim)
+        # Utilisation stricte du display_name
+        generated_text = generate_morning_text(member.display_name, context, is_victim)
         prefix = "💥 **Le tacle du matin :**\n" if is_victim else "☀️ **Bonjour !**\n"
         full_message = f"{prefix}{generated_text}"
 
@@ -205,6 +193,7 @@ async def run_daily_routine(dry_run: bool = False):
         print("-" * 50)
 
     print(f"==================== FIN ROUTINE MATINALE {mode} ====================\n")
+
 
 @bot.event
 async def on_ready():
@@ -228,7 +217,7 @@ async def on_ready():
 @app_commands.default_permissions(administrator=True)
 async def test_matin(interaction: discord.Interaction):
     await interaction.response.send_message(
-        "Simulation lancée ! Regarde les logs Square Cloud.",
+        "Simulation lancée ! Regarde les logs Square Cloud pour inspecter les messages.",
         ephemeral=True
     )
     await run_daily_routine(dry_run=True)
@@ -238,7 +227,7 @@ async def test_matin(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 async def envoyer_maintenant(interaction: discord.Interaction):
     await interaction.response.send_message(
-        "Tournée réelle démarrée.",
+        "Tournée réelle démarrée. Les DM sont en cours d'envoi.",
         ephemeral=True
     )
     await run_daily_routine(dry_run=False)
