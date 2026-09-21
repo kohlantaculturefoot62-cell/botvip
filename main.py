@@ -167,17 +167,17 @@ class PersistentDilemmaView(discord.ui.View):
         super().__init__(timeout=None)
 
     def extract_data_and_vote(self, message: discord.Message, user: discord.Member, vote_for: str) -> discord.Embed:
-        embed = message.embeds[0]
-        situation = embed.description
+        old_embed = message.embeds[0]
+        description = old_embed.description
 
-        opt_a_name = embed.fields[0].name
-        opt_b_name = embed.fields[1].name
+        field_a_val = old_embed.fields[0].value
+        field_b_val = old_embed.fields[1].value
 
-        raw_voters_a = embed.fields[0].value.replace("Aucun vote pour l'instant.", "").split(", ")
-        raw_voters_b = embed.fields[1].value.replace("Aucun vote pour l'instant.", "").split(", ")
+        raw_voters_a = [] if "Aucun vote" in field_a_val else [v.strip() for v in field_a_val.split(", ") if v.strip()]
+        raw_voters_b = [] if "Aucun vote" in field_b_val else [v.strip() for v in field_b_val.split(", ") if v.strip()]
 
-        voters_a = set(v.strip() for v in raw_voters_a if v.strip())
-        voters_b = set(v.strip() for v in raw_voters_b if v.strip())
+        voters_a = set(raw_voters_a)
+        voters_b = set(raw_voters_b)
 
         user_mention = user.mention
 
@@ -189,16 +189,18 @@ class PersistentDilemmaView(discord.ui.View):
             voters_b.add(user_mention)
 
         new_embed = discord.Embed(
-            title="⚡ DILEMME CORNÉLIEN ⚡",
-            description=situation,
+            title=old_embed.title,
+            description=description,
             color=discord.Color.dark_red()
         )
+
         val_a = ", ".join(voters_a) if voters_a else "Aucun vote pour l'instant."
         val_b = ", ".join(voters_b) if voters_b else "Aucun vote pour l'instant."
 
-        new_embed.add_field(name=f"{opt_a_name.split(' (')[0]} ({len(voters_a)})", value=val_a, inline=False)
-        new_embed.add_field(name=f"{opt_b_name.split(' (')[0]} ({len(voters_b)})", value=val_b, inline=False)
+        new_embed.add_field(name=f"🔴 Votes Option A ({len(voters_a)})", value=val_a, inline=False)
+        new_embed.add_field(name=f"🔵 Votes Option B ({len(voters_b)})", value=val_b, inline=False)
         new_embed.set_footer(text="Cliquez ci-dessous pour voter ou modifier votre choix !")
+
         return new_embed
 
     @discord.ui.button(label="Voter A", style=discord.ButtonStyle.danger, custom_id="dilemma_btn_a")
@@ -283,7 +285,7 @@ Voici le contexte des discussions sur le serveur :
 ---
 
 CONSIGNES SUR L'IDENTITÉ ET LE GENRE :
-1. Nom d'appel : Appelle la personne UNIQUEMENT par son nom d'affichage '{display_name}'.
+1. Nom d'appel : Appelle la personne UNIQUEMENT par son nom d'affichage '{display_name}'. N'invente pas d'autre nom.
 2. Genre et accords : Analyse les messages pour déduire si '{display_name}' est un homme ou une femme. Accorde TOUS tes adjectifs et participes passés en conséquence.
 """
 
@@ -382,7 +384,6 @@ async def run_daily_routine(dry_run: bool = False):
 async def on_ready():
     print(f"Bot connecté en tant que : {bot.user.name} ({bot.user.id})")
 
-    # Enregistrement de la vue pour conserver les boutons actifs au redémarrage
     bot.add_view(PersistentDilemmaView())
 
     guild_obj = discord.Object(id=GUILD_ID)
@@ -405,13 +406,19 @@ async def dilemme(interaction: discord.Interaction):
 
     situation, opt_a, opt_b = generate_hardcore_dilemma()
 
+    desc = (
+        f"**{situation}**\n\n"
+        f"🔴 **Option A :**\n{opt_a}\n\n"
+        f"🔵 **Option B :**\n{opt_b}"
+    )
+
     embed = discord.Embed(
         title="⚡ DILEMME CORNÉLIEN ⚡",
-        description=f"**{situation}**",
+        description=desc,
         color=discord.Color.dark_red()
     )
-    embed.add_field(name=f"🔴 Option A : {opt_a} (0)", value="Aucun vote pour l'instant.", inline=False)
-    embed.add_field(name=f"🔵 Option B : {opt_b} (0)", value="Aucun vote pour l'instant.", inline=False)
+    embed.add_field(name="🔴 Votes Option A (0)", value="Aucun vote pour l'instant.", inline=False)
+    embed.add_field(name="🔵 Votes Option B (0)", value="Aucun vote pour l'instant.", inline=False)
     embed.set_footer(text="Cliquez ci-dessous pour voter ou modifier votre choix !")
 
     view = PersistentDilemmaView()
