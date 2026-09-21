@@ -26,12 +26,11 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 scheduler = AsyncIOScheduler()
 
 
+# ==============================================================================
+# 1. LOGIQUE MATINALE (COMPLIMENTS & CLASHS)
+# ==============================================================================
+
 async def get_comprehensive_user_context(guild: discord.Guild, member: discord.Member) -> str:
-    """
-    Récupère :
-    1. Ce que la personne écrit (pour capter ses délires et sujets récents).
-    2. Ce que les autres lui disent (pour déduire le genre et les accords).
-    """
     user_messages = []
     mentions_and_replies = []
 
@@ -46,11 +45,8 @@ async def get_comprehensive_user_context(guild: discord.Guild, member: discord.M
                 if not content:
                     continue
 
-                # Messages écrits par le membre
                 if msg.author.id == member.id and len(user_messages) < 10:
                     user_messages.append(f"- {content}")
-
-                # Messages des autres qui le mentionnent ou lui répondent
                 elif (member.mentioned_in(msg) or str(member.id) in msg.content) and len(mentions_and_replies) < 6:
                     mentions_and_replies.append(f"- {msg.author.display_name} a dit : \"{content}\"")
 
@@ -75,7 +71,6 @@ async def get_comprehensive_user_context(guild: discord.Guild, member: discord.M
 
 
 def generate_morning_text(display_name: str, context: str, is_victim: bool) -> str:
-    """Génère le texte du matin avec le display_name et déduction automatique du genre."""
     sweet_styles = [
         "coach de vie surmotivé façon TED Talk, mais avec un second degré bienveillant",
         "pote sincère qui pose les termes et prend le temps d'envoyer de la vraie bonne énergie",
@@ -102,36 +97,34 @@ Voici le contexte des discussions sur le serveur :
 ---
 
 CONSIGNES SUR L'IDENTITÉ ET LE GENRE :
-1. Nom d'appel : Appelle la personne UNIQUEMENT par son nom d'affichage '{display_name}'. N'invente pas d'autre nom.
-2. Genre et accords : Analyse les messages pour déduire si '{display_name}' est un homme ou une femme (regarde les adjectifs employés par les autres ou par la personne elle-même). Accorde TOUS tes adjectifs et participes passés en conséquence (ex: 'prêt/prête', 'fatigué/fatiguée', 'motivé/motivée'). Si c'est ambigu, privilégie des tournures neutres ou masculines par défaut.
+1. Nom d'appel : Appelle la personne UNIQUEMENT par son nom d'affichage '{display_name}'.
+2. Genre et accords : Déduis si '{display_name}' est un homme ou une femme d'après les messages. Accorde TOUS tes adjectifs et participes passés en conséquence.
 """
 
     if is_victim:
         prompt = f"""
 Tu es un pote sur un serveur Discord. Tu dois rédiger le tacle du matin destiné à '{display_name}'.
 {common_instructions}
-
 Ton angle d'attaque du jour : adopte un ton de **{chosen_style}**.
 
 Consignes :
-- Développe un message consistant et bien écrit (3 à 5 phrases, environ 50 à 90 mots). Ne sois pas trop bref, pose bien la vanne.
-- Fais des références précises à ses messages récents ou à sa manière de s'exprimer.
-- Si le contexte indique qu'il/elle n'a pas parlé, clashe-le/la sur son statut de fantôme passif sur le serveur.
-- Reste dans le chambrage entre potes : drôle, piquant, mais sans haine ni vulgarité gratuite.
+- Développe un message consistant (3 à 5 phrases, 50 à 90 mots).
+- Fais des références précises à ses messages récents ou à ses habitudes.
+- Si le contexte indique qu'il/elle n'a pas parlé, clashe-le/la sur son statut de fantôme passif.
+- Reste dans le chambrage entre potes : drôle, piquant, sans haine.
 - Réponds UNIQUEMENT le texte du message, sans guillemets, sans titre.
 """
     else:
         prompt = f"""
-Tu es un ami proche et chaleureux sur un serveur Discord. Tu dois rédiger un mot doux / message d'encouragement matinal personnalisé pour '{display_name}'.
+Tu es un ami proche sur un serveur Discord. Tu dois rédiger un mot doux personnalisé pour '{display_name}'.
 {common_instructions}
-
 Ton style du jour : adopte un ton de **{chosen_style}**.
 
 Consignes :
-- Écris un texte riche, vivant et sympa (3 à 5 phrases, environ 50 à 90 mots). Ne fais pas un message expéditif de deux lignes.
-- Inspire-toi réellement de ce qu'il/elle raconte ou de ses passions pour que ce soit du sur-mesure.
-- Si le contexte indique qu'il/elle n'a pas beaucoup parlé récemment, dis-lui avec humour et bienveillance qu'il/elle manque aux discussions.
-- Sois naturel, évite le ton robotique ou corporate.
+- Écris un texte riche et sympa (3 à 5 phrases, 50 à 90 mots).
+- Inspire-toi réellement de ce qu'il/elle raconte.
+- Si le contexte indique qu'il/elle n'a pas beaucoup parlé, glisse gentiment qu'il/elle manque aux débats.
+- Sois naturel, évite le ton robotique.
 - Réponds UNIQUEMENT le texte du message, sans guillemets, sans titre.
 """
 
@@ -147,7 +140,7 @@ Consignes :
 
 
 async def run_daily_routine(dry_run: bool = False):
-    mode = "[MODE SIMULATION / AUCUN ENVOI]" if dry_run else "[MODE RÉEL / ENVOI DM]"
+    mode = "[MODE SIMULATION]" if dry_run else "[MODE RÉEL]"
     print(f"\n==================== DÉBUT ROUTINE MATINALE {mode} ====================")
 
     guild = bot.get_guild(GUILD_ID)
@@ -167,11 +160,9 @@ async def run_daily_routine(dry_run: bool = False):
         is_victim = (member.id == victim.id)
         role_label = "CLASH" if is_victim else "GENTIL"
 
-        # Contexte
         context = await get_comprehensive_user_context(guild, member)
         print(f"👤 Membre : {member.display_name} (@{member.name}) | Rôle : {role_label}")
 
-        # Utilisation stricte du display_name
         generated_text = generate_morning_text(member.display_name, context, is_victim)
         prefix = "💥 **Le tacle du matin :**\n" if is_victim else "☀️ **Bonjour !**\n"
         full_message = f"{prefix}{generated_text}"
@@ -195,14 +186,117 @@ async def run_daily_routine(dry_run: bool = False):
     print(f"==================== FIN ROUTINE MATINALE {mode} ====================\n")
 
 
+# ==============================================================================
+# 2. SYSTÈME DE DILEMME PERSISTANT AVEC AFFICHAGE DES VOTANTS
+# ==============================================================================
+
+def generate_hardcore_dilemma() -> tuple[str, str, str]:
+    """Génère un dilemme cornélien et extrême."""
+    prompt = """
+Génère un dilemme "Tu préfères" extrêmement difficile, absurde ou cornélien pour animer un débat animé entre potes.
+Les deux options doivent être quasi impossibles à départager, très inconfortables, honteuses ou intenses.
+
+Règles strictes :
+- Pas de contenu impliquant des mineurs.
+- Uniquement des situations fictives, des sacrifices moraux, des choix absurdes ou de la honte sociale entre adultes.
+- Format de réponse STRICTEMENT attendu (3 lignes) :
+SITUATION: [Une phrase courte qui pose le contexte dramatique ou absurde]
+OPTION_A: [Le premier choix, percutant et précis]
+OPTION_B: [Le second choix, tout aussi difficile ou horrible]
+"""
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=prompt
+        )
+        lines = [line.strip() for line in response.text.strip().splitlines() if line.strip()]
+        situation, opt_a, opt_b = "Choix cornélien :", "Option A", "Option B"
+        for line in lines:
+            if line.startswith("SITUATION:"):
+                situation = line.replace("SITUATION:", "").strip()
+            elif line.startswith("OPTION_A:"):
+                opt_a = line.replace("OPTION_A:", "").strip()
+            elif line.startswith("OPTION_B:"):
+                opt_b = line.replace("OPTION_B:", "").strip()
+        return situation, opt_a, opt_b
+    except Exception as e:
+        print(f"Erreur dilemme : {e}")
+        return (
+            "Vous devez survivre sur une île déserte pendant 1 an :",
+            "Devoir marcher pieds nus sur des Lego 30 minutes chaque matin",
+            "N'avoir le droit de boire que de l'eau tiède avec du sel"
+        )
+
+
+class PersistentDilemmaView(discord.ui.View):
+    def __init__(self):
+        # timeout=None rend la vue permanente (ne meurt pas au redémarrage)
+        super().__init__(timeout=None)
+
+    def extract_data_and_vote(self, message: discord.Message, user: discord.Member, vote_for: str) -> discord.Embed:
+        embed = message.embeds[0]
+        situation = embed.description
+
+        # Extraction des deux options et des votants depuis les fields de l'Embed
+        opt_a_name = embed.fields[0].name
+        opt_b_name = embed.fields[1].name
+
+        # Parse les votants actuels (IDs de mention <@123...>)
+        raw_voters_a = embed.fields[0].value.replace("Aucun vote pour l'instant.", "").split(", ")
+        raw_voters_b = embed.fields[1].value.replace("Aucun vote pour l'instant.", "").split(", ")
+
+        voters_a = set(v.strip() for v in raw_voters_a if v.strip())
+        voters_b = set(v.strip() for v in raw_voters_b if v.strip())
+
+        user_mention = user.mention
+
+        if vote_for == "A":
+            voters_b.discard(user_mention)
+            voters_a.add(user_mention)
+        else:
+            voters_a.discard(user_mention)
+            voters_b.add(user_mention)
+
+        # Reconstruction de l'Embed
+        new_embed = discord.Embed(
+            title="⚡ DILEMME CORNÉLIEN ⚡",
+            description=situation,
+            color=discord.Color.dark_red()
+        )
+        val_a = ", ".join(voters_a) if voters_a else "Aucun vote pour l'instant."
+        val_b = ", ".join(voters_b) if voters_b else "Aucun vote pour l'instant."
+
+        new_embed.add_field(name=f"{opt_a_name.split(' (')[0]} ({len(voters_a)})", value=val_a, inline=False)
+        new_embed.add_field(name=f"{opt_b_name.split(' (')[0]} ({len(voters_b)})", value=val_b, inline=False)
+        new_embed.set_footer(text="Cliquez sur les boutons ci-dessous pour voter ou changer d'avis !")
+        return new_embed
+
+    @discord.ui.button(label="Voter A", style=discord.ButtonStyle.danger, custom_id="dilemma_btn_a")
+    async def btn_a(self, interaction: discord.Interaction, button: discord.ui.Button):
+        new_embed = self.extract_data_and_vote(interaction.message, interaction.user, "A")
+        await interaction.response.edit_message(embed=new_embed, view=self)
+
+    @discord.ui.button(label="Voter B", style=discord.ButtonStyle.primary, custom_id="dilemma_btn_b")
+    async def btn_b(self, interaction: discord.Interaction, button: discord.ui.Button):
+        new_embed = self.extract_data_and_vote(interaction.message, interaction.user, "B")
+        await interaction.response.edit_message(embed=new_embed, view=self)
+
+
+# ==============================================================================
+# 3. COMMANDES ET INITIALISATION DU BOT
+# ==============================================================================
+
 @bot.event
 async def on_ready():
     print(f"Bot connecté en tant que : {bot.user.name} ({bot.user.id})")
 
+    # Enregistrement de la vue persistante pour qu'elle fonctionne même après redémarrage
+    bot.add_view(PersistentDilemmaView())
+
     guild_obj = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild_obj)
     synced = await bot.tree.sync(guild=guild_obj)
-    print(f"{len(synced)} commande(s) slash synchronisée(s) sur le serveur {GUILD_ID}.")
+    print(f"{len(synced)} commande(s) slash synchronisée(s).")
 
     scheduler.add_job(
         run_daily_routine,
@@ -211,6 +305,25 @@ async def on_ready():
     )
     scheduler.start()
     print("Planificateur matinal actif (08:00 Europe/Paris).")
+
+
+@bot.tree.command(name="dilemme", description="Lance un dilemme cornélien dans le salon avec votes en direct")
+async def dilemme(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    situation, opt_a, opt_b = generate_hardcore_dilemma()
+
+    embed = discord.Embed(
+        title="⚡ DILEMME CORNÉLIEN ⚡",
+        description=f"**{situation}**",
+        color=discord.Color.dark_red()
+    )
+    embed.add_field(name=f"🔴 Option A : {opt_a} (0)", value="Aucun vote pour l'instant.", inline=False)
+    embed.add_field(name=f"🔵 Option B : {opt_b} (0)", value="Aucun vote pour l'instant.", inline=False)
+    embed.set_footer(text="Cliquez sur les boutons ci-dessous pour voter ou changer d'avis !")
+
+    view = PersistentDilemmaView()
+    await interaction.followup.send(embed=embed, view=view)
 
 
 @bot.tree.command(name="test_matin", description="Simule la tournée matinale dans les logs sans envoyer de DM")
@@ -231,91 +344,7 @@ async def envoyer_maintenant(interaction: discord.Interaction):
         ephemeral=True
     )
     await run_daily_routine(dry_run=False)
-def generate_hardcore_dilemma() -> tuple[str, str, str]:
-    """Génère un dilemme cornélien et extrême, et renvoie (titre/mise en situation, option_a, option_b)."""
-    prompt = """
-Génère un dilemme "Tu préfères" extrêmement difficile, absurde ou cornélien pour animer un débat animé entre potes.
-Les deux options doivent être quasi impossibles à départager, très inconfortables, honteuses ou intenses.
-
-Règles strictes :
-- Pas de contenu impliquant des mineurs.
-- Uniquement des situations fictives, des sacrifices moraux, des choix absurdes, ou de la honte sociale entre adultes.
-- Format de réponse STRICTEMENT attendu (3 lignes, rien d'autre) :
-SITUATION: [Une phrase courte qui pose le contexte dramatique ou absurde]
-OPTION_A: [Le premier choix, percutant et précis]
-OPTION_B: [Le second choix, tout aussi difficile ou horrible]
-"""
-
-    try:
-        response = ai_client.models.generate_content(
-            model="gemini-3.5-flash",
-            contents=prompt
-        )
-        lines = [line.strip() for line in response.text.strip().splitlines() if line.strip()]
-        
-        situation = "Le choix impossible du jour :"
-        opt_a = "Option 1"
-        opt_b = "Option 2"
-
-        for line in lines:
-            if line.startswith("SITUATION:"):
-                situation = line.replace("SITUATION:", "").strip()
-            elif line.startswith("OPTION_A:"):
-                opt_a = line.replace("OPTION_A:", "").strip()
-            elif line.startswith("OPTION_B:"):
-                opt_b = line.replace("OPTION_B:", "").strip()
-
-        return situation, opt_a, opt_b
-    except Exception as e:
-        print(f"Erreur génération dilemme : {e}")
-        return (
-            "Vous êtes coincés dans un ascenseur pour 48h sans issue :",
-            "Devoir raconter ton pire secret inavouable à tout ton entourage en direct",
-            "Manger uniquement de la nourriture pour chat pendant les 6 prochains mois"
-        )
-class DilemmaView(discord.ui.View):
-    def __init__(self, opt_a: str, opt_b: str):
-        super().__init__(timeout=300)  # Actif pendant 5 minutes
-        self.opt_a = opt_a
-        self.opt_b = opt_b
-        self.votes_a = set()
-        self.votes_b = set()
-
-    def update_labels(self):
-        self.children[0].label = f"A ({len(self.votes_a)})"
-        self.children[1].label = f"B ({len(self.votes_b)})"
-
-    @discord.ui.button(label="Option A (0)", style=discord.ButtonStyle.danger)
-    async def vote_a(self, interaction: discord.Interaction, button: discord.ui.Button):
-        user_id = interaction.user.id
-        self.votes_b.discard(user_id)
-        self.votes_a.add(user_id)
-        self.update_labels()
-        await interaction.response.edit_message(view=self)
-
-    @discord.ui.button(label="Option B (0)", style=discord.ButtonStyle.primary)
-    async def vote_b(self, interaction: discord.Interaction, button: discord.ui.Button):
-        user_id = interaction.user.id
-        self.votes_a.discard(user_id)
-        self.votes_b.add(user_id)
-        self.update_labels()
-        await interaction.response.edit_message(view=self)
 
 
-@bot.tree.command(name="dilemme", description="Lance un dilemme impossible à départager dans le salon")
-async def dilemme(interaction: discord.Interaction):
-    await interaction.response.defer()  # Laisse le temps à l'API de répondre
-
-    situation, opt_a, opt_b = generate_hardcore_dilemma()
-
-    embed = discord.Embed(
-        title="⚡ DILEMME CORNÉLIEN ⚡",
-        description=f"**{situation}**\n\n🔴 **Option A :** {opt_a}\n\n🔵 **Option B :** {opt_b}",
-        color=discord.Color.dark_red()
-    )
-    embed.set_footer(text="Cliquez ci-dessous pour voter et justifier votre choix dans le chat !")
-
-    view = DilemmaView(opt_a, opt_b)
-    await interaction.followup.send(embed=embed, view=view)
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
