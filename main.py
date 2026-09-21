@@ -273,6 +273,49 @@ OPTION_B: [Le second choix, tout aussi difficile ou horrible]
             "Devoir raconter ton pire secret inavouable à tout ton entourage en direct",
             "Manger uniquement de la nourriture pour chat pendant les 6 prochains mois"
         )
+class DilemmaView(discord.ui.View):
+    def __init__(self, opt_a: str, opt_b: str):
+        super().__init__(timeout=300)  # Actif pendant 5 minutes
+        self.opt_a = opt_a
+        self.opt_b = opt_b
+        self.votes_a = set()
+        self.votes_b = set()
 
+    def update_labels(self):
+        self.children[0].label = f"A ({len(self.votes_a)})"
+        self.children[1].label = f"B ({len(self.votes_b)})"
+
+    @discord.ui.button(label="Option A (0)", style=discord.ButtonStyle.danger)
+    async def vote_a(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = interaction.user.id
+        self.votes_b.discard(user_id)
+        self.votes_a.add(user_id)
+        self.update_labels()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="Option B (0)", style=discord.ButtonStyle.primary)
+    async def vote_b(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id = interaction.user.id
+        self.votes_a.discard(user_id)
+        self.votes_b.add(user_id)
+        self.update_labels()
+        await interaction.response.edit_message(view=self)
+
+
+@bot.tree.command(name="dilemme", description="Lance un dilemme impossible à départager dans le salon")
+async def dilemme(interaction: discord.Interaction):
+    await interaction.response.defer()  # Laisse le temps à l'API de répondre
+
+    situation, opt_a, opt_b = generate_hardcore_dilemma()
+
+    embed = discord.Embed(
+        title="⚡ DILEMME CORNÉLIEN ⚡",
+        description=f"**{situation}**\n\n🔴 **Option A :** {opt_a}\n\n🔵 **Option B :** {opt_b}",
+        color=discord.Color.dark_red()
+    )
+    embed.set_footer(text="Cliquez ci-dessous pour voter et justifier votre choix dans le chat !")
+
+    view = DilemmaView(opt_a, opt_b)
+    await interaction.followup.send(embed=embed, view=view)
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
