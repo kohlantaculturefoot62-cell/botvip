@@ -231,7 +231,48 @@ async def envoyer_maintenant(interaction: discord.Interaction):
         ephemeral=True
     )
     await run_daily_routine(dry_run=False)
+def generate_hardcore_dilemma() -> tuple[str, str, str]:
+    """Génère un dilemme cornélien et extrême, et renvoie (titre/mise en situation, option_a, option_b)."""
+    prompt = """
+Génère un dilemme "Tu préfères" extrêmement difficile, absurde ou cornélien pour animer un débat animé entre potes.
+Les deux options doivent être quasi impossibles à départager, très inconfortables, honteuses ou intenses.
 
+Règles strictes :
+- Pas de contenu impliquant des mineurs.
+- Uniquement des situations fictives, des sacrifices moraux, des choix absurdes, ou de la honte sociale entre adultes.
+- Format de réponse STRICTEMENT attendu (3 lignes, rien d'autre) :
+SITUATION: [Une phrase courte qui pose le contexte dramatique ou absurde]
+OPTION_A: [Le premier choix, percutant et précis]
+OPTION_B: [Le second choix, tout aussi difficile ou horrible]
+"""
+
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=prompt
+        )
+        lines = [line.strip() for line in response.text.strip().splitlines() if line.strip()]
+        
+        situation = "Le choix impossible du jour :"
+        opt_a = "Option 1"
+        opt_b = "Option 2"
+
+        for line in lines:
+            if line.startswith("SITUATION:"):
+                situation = line.replace("SITUATION:", "").strip()
+            elif line.startswith("OPTION_A:"):
+                opt_a = line.replace("OPTION_A:", "").strip()
+            elif line.startswith("OPTION_B:"):
+                opt_b = line.replace("OPTION_B:", "").strip()
+
+        return situation, opt_a, opt_b
+    except Exception as e:
+        print(f"Erreur génération dilemme : {e}")
+        return (
+            "Vous êtes coincés dans un ascenseur pour 48h sans issue :",
+            "Devoir raconter ton pire secret inavouable à tout ton entourage en direct",
+            "Manger uniquement de la nourriture pour chat pendant les 6 prochains mois"
+        )
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
