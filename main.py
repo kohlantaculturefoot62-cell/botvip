@@ -191,18 +191,21 @@ async def run_daily_routine(dry_run: bool = False):
 # ==============================================================================
 
 def generate_hardcore_dilemma() -> tuple[str, str, str]:
-    """Génère un dilemme cornélien et extrême."""
+    """Génère un dilemme cornélien où les deux coûts sont d'intensité strictement équivalente (visée 50/50)."""
     prompt = """
-Génère un dilemme "Tu préfères" extrêmement difficile, absurde ou cornélien pour animer un débat animé entre potes.
-Les deux options doivent être quasi impossibles à départager, très inconfortables, honteuses ou intenses.
+Tu es un concepteur d'expériences de pensée et de dilemmes moraux extrêmes.
+Ton but absolu est de générer un dilemme "Tu préfères" qui produira un vote parfaitement divisé (50% / 50%) au sein d'un groupe d'adultes.
 
-Règles strictes :
-- Pas de contenu impliquant des mineurs.
-- Uniquement des situations fictives, des sacrifices moraux, des choix absurdes ou de la honte sociale entre adultes.
-- Format de réponse STRICTEMENT attendu (3 lignes) :
-SITUATION: [Une phrase courte qui pose le contexte dramatique ou absurde]
-OPTION_A: [Le premier choix, percutant et précis]
-OPTION_B: [Le second choix, tout aussi difficile ou horrible]
+Règles de calibration stricte :
+1. Symétrie du coût : Les deux options doivent infliger une perte, une honte ou une contrainte d'intensité globale strictement égale. Si l'Option A implique une douleur physique ou une humiliation publique, l'Option B doit imposer un sacrifice moral ou social d'un poids équivalent.
+2. Pas d'échappatoire : Aucune des deux options ne doit être manifestement "moins pire" que l'autre.
+3. Thématiques autorisées : Tabous sociaux entre adultes, sacrifices irréversibles, perte de dignité publique, révélations destructrices, choix absurdes à fort enjeu.
+4. Interdictions : Pas de contenu impliquant des mineurs.
+
+Structure de réponse OBLIGATOIRE (exactement 3 lignes) :
+SITUATION: [Mise en contexte courte et dramatique]
+OPTION_A: [Premier fardeau, précis et concret]
+OPTION_B: [Second fardeau, rigoureusement équivalent en intensité]
 """
     try:
         response = ai_client.models.generate_content(
@@ -210,7 +213,7 @@ OPTION_B: [Le second choix, tout aussi difficile ou horrible]
             contents=prompt
         )
         lines = [line.strip() for line in response.text.strip().splitlines() if line.strip()]
-        situation, opt_a, opt_b = "Choix cornélien :", "Option A", "Option B"
+        situation, opt_a, opt_b = "Choix à balance égale :", "Option A", "Option B"
         for line in lines:
             if line.startswith("SITUATION:"):
                 situation = line.replace("SITUATION:", "").strip()
@@ -222,9 +225,9 @@ OPTION_B: [Le second choix, tout aussi difficile ou horrible]
     except Exception as e:
         print(f"Erreur dilemme : {e}")
         return (
-            "Vous devez survivre sur une île déserte pendant 1 an :",
-            "Devoir marcher pieds nus sur des Lego 30 minutes chaque matin",
-            "N'avoir le droit de boire que de l'eau tiède avec du sel"
+            "Pour éviter une condamnation arbitraire, vous devez choisir l'une de ces deux sanctions :",
+            "L'historique complet de vos recherches et messages privés des 5 dernières années est lu à haute voix devant votre famille et vos collègues",
+            "Chaque conversation que vous aurez pour le reste de votre vie sera obligatoirement diffusée en direct sur haut-parleur"
         )
 
 
