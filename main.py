@@ -449,6 +449,164 @@ async def envoyer_maintenant(interaction: discord.Interaction):
     )
     await run_daily_routine(dry_run=False)
 
+# ========================================================
+# MODULE : RAFALE DE QUESTIONS DE VITESSE (AUTO-RESET CHRONO)
+# ========================================================
+
+import time
+import discord
+from discord import app_commands
+
+# Salon privé des organisateurs
+CHAN_LOGS_ORGA_ID = 1551027822925971536  # Remplace par l'ID de votre salon orga
+
+# Suivi de la session de rafale
+SESSION_VITESSE = {
+    "actif": False,
+    "channel_id": None,
+    "num_question": 0,
+    "texte_question": "",
+    "top_depart": 0.0,
+    "reponses_question": {}  # { user_id: { "membre": Member, "chrono": float, "texte": str } }
+}
+
+
+def est_role_orga(user: discord.Member) -> bool:
+    """Vérifie si l'utilisateur a un rôle organisateur/admin."""
+    if user.guild_permissions.administrator:
+        return True
+    roles_orga = {"orga", "organisateur", "admin", "mj", "maitre du jeu", "animation"}
+    return any(r.name.lower() in roles_orga for r in user.roles)
+
+
+async def demarrer_nouvelle_question(channel: discord.TextChannel, question_str: str, auteur: discord.Member):
+    """Initialise une nouvelle question, remet le chrono à 0 et prépare l'interception."""
+    SESSION_VITESSE["actif"] = True
+    SESSION_VITESSE["channel_id"] = channel.id
+    SESSION_VITESSE["num_question"] += 1
+    SESSION_VITESSE["texte_question"] = question_str
+    SESSION_VITESSE["reponses_question"].clear()
+    SESSION_VITESSE["top_depart"] = time.time()
+
+    embed = discord.Embed(
+        title=f"⚡ QUESTION #{SESSION_VITESSE['num_question']}",
+        description=f"# {question_str}\n\n🔒 *Tapez votre réponse directement ici, elle sera supprimée à la milliseconde.*",
+        color=discord.Color.red()
+    )
+    embed.set_footer(text=f"Lancée par {auteur.display_name} • Le chrono tourne !")
+    await channel.send(embed=embed)
+
+
+# --------------------------------------------------------
+# 1. COMMANDES POUR POSER LA QUESTION
+# --------------------------------------------------------
+
+# Option A : Commande slash /q
+@bot.tree.command(name="q", description="Pose une question de vitesse et déclenche le chrono.")
+@app_commands.describe(question="L'énoncé de la question")
+@app_commands.check(est_orga_ou_admin)
+async def q_slash(interaction: discord.Interaction, question: str):
+    await interaction.response.defer(ephemeral=True)
+    await demarrer_nouvelle_question(interaction.channel, question, interaction.user)
+    await interaction.followup.send(f"✅ Question #{SESSION_VITESSE['num_question']} lancée !", ephemeral=True)
+
+
+# --------------------------------------------------------
+# 2. INTERCEPTION SUR ON_MESSAGE (QUESTIONS & RÉPONSES)
+# --------------------------------------------------------
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    contenu = message.content.strip()
+
+    # --- A. L'ORGA TAPE DIRECTEMENT "!q <question>" DANS LE CHAT ---
+    if contenu.lower().startswith("!q ") and isinstance(message.author, discord.Member) and est_role_orga(message.author):
+        question_texte = contenu[3:].strip()
+        try:
+            await message.delete()  # Supprime le trigger "!q ..."
+        except discord.DiscordException:
+            pass
+        await demarrer_nouvelle_question(message.channel, question_texte, message.author)
+        return
+
+    # --- B. UN CANDIDAT RÉPOND PENDANT LE CHRONO ACTIF ---
+    if SESSION_VITESSE["actif"] and message.channel.id == SESSION_VITESSE["channel_id"]:
+        # Ne pas intercepter les messages des orgas (sauf s'ils ne mettent pas de commande)
+        if not est_role_orga(message.author):
+            # 1. Suppression PRIORITAIRE ABSOLUE du message du candidat
+            try:
+                await message.delete()
+            except discord.DiscordException as e:
+                print(f"⚠️ Erreur auto-delete : {e}")
+
+            # 2. Calcul du chrono par rapport au top départ de CETTE question
+            chrono = time.time() - SESSION_VITESSE["top_depart"]
+            uid = message.author.id
+
+            # Une seule réponse comptabilisée par question
+            if uid in SESSION_VITESSE["reponses_question"]:
+                return
+
+            SESSION_VITESSE["reponses_question"][uid] = {
+                "membre": message.author,
+                "chrono": chrono,
+                "texte": contenu
+            }
+
+            # 3. Alerte instantanée aux orgas dans leur salon secret
+            salon_orga = message.guild.get_channel(CHAN_LOGS_ORGA_ID)
+            if salon_orga:
+                rang = len(SESSION_VITESSE["reponses_question"])
+                embed_log = discord.Embed(
+                    title=f"⚡ Q#{SESSION_VITESSE['num_question']} — Réponse #{rang} en `{chrono:.2f}s`",
+                    description=(
+                        f"**Aventurier :** {message.author.mention} (`{message.author.display_name}`)\n"
+                        f"**Question :** *{SESSION_VITESSE['texte_question']}*\n"
+                        f"**Réponse interceptée :** ```\n{contenu}\n```"
+                    ),
+                    color=discord.Color.green() if rang == 1 else discord.Color.gold(),
+                    timestamp=discord.utils.utcnow()
+                )
+                embed_log.set_thumbnail(url=message.author.display_avatar.url)
+                await salon_orga.send(embed=embed_log)
+
+            return
+
+    await bot.process_commands(message)
+
+
+# --------------------------------------------------------
+# 3. ARRÊTER OU METTRE EN PAUSE LA VITESSE
+# --------------------------------------------------------
+
+@bot.tree.command(name="stop_vitesse", description="Stoppe le chronomètre et clôture la question en cours.")
+@app_commands.check(est_orga_ou_admin)
+async def stop_vitesse(interaction: discord.Interaction):
+    if not SESSION_VITESSE["actif"]:
+        await interaction.response.send_message("Aucune question de vitesse active.", ephemeral=True)
+        return
+
+    SESSION_VITESSE["actif"] = False
+
+    reponses = list(SESSION_VITESSE["reponses_question"].values())
+    reponses.sort(key=lambda x: x["chrono"])
+
+    lignes = []
+    medailles = ["🥇", "🥈", "🥉"]
+    for i, data in enumerate(reponses):
+        symbole = medailles[i] if i < 3 else f"`#{i+1}`"
+        lignes.append(f"{symbole} **{data['membre'].display_name}** — `{data['chrono']:.2f}s` : *« {data['texte']} »*")
+
+    embed_bilan = discord.Embed(
+        title=f"🛑 FIN QUESTION #{SESSION_VITESSE['num_question']}",
+        description=f"**Énoncé :** {SESSION_VITESSE['texte_question']}\n\n" + 
+                    ("\n".join(lignes) if lignes else "*Aucune réponse reçue à temps.*"),
+        color=discord.Color.dark_grey()
+    )
+    await interaction.response.send_message(embed=embed_bilan)
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
