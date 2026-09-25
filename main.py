@@ -450,7 +450,7 @@ async def envoyer_maintenant(interaction: discord.Interaction):
     await run_daily_routine(dry_run=False)
 
 # ========================================================
-# MODULE : QUESTIONS DE VITESSE & JUSTE PRIX (TIMER 10S)
+# MODULE : QUESTIONS DE VITESSE DEPUIS UN SALON DISCORD
 # ========================================================
 
 import re
@@ -460,23 +460,27 @@ from difflib import SequenceMatcher
 import discord
 from discord import app_commands
 
-CHAN_LOGS_ORGA_ID = 1551027822925971536  # ID de votre salon orga
+CHAN_LOGS_ORGA_ID = 1553032799995564204  # ID de votre salon orga
+CHAN_BANQUE_QUESTIONS_ID = 1553034639604715581            # 👈 Mets ici l'ID du salon Discord contenant tes questions
+
+# Liste dynamique chargée depuis le salon
+BANQUE_QUESTIONS_DYNAMIQUE = []
 
 SESSION_VITESSE = {
+    "index_liste": 0,
     "actif": False,
     "channel_id": None,
     "num_question": 0,
     "texte_question": "",
     "reponse_cible_brute": "",
-    "reponse_cible_num": None,      # float ou None
+    "reponse_cible_num": None,
     "top_depart": 0.0,
     "task_timer": None,
-    "reponses_question": {}         # { user_id: { "membre": Member, "chrono": float, "texte": str, "val_num": float, "score": float } }
+    "reponses_question": {}
 }
 
 
 def est_role_orga(user: discord.Member) -> bool:
-    """Vérifie si l'utilisateur a un rôle organisateur/admin."""
     if user.guild_permissions.administrator:
         return True
     roles_orga = {"orga", "organisateur", "admin", "mj", "maitre du jeu", "animation"}
@@ -484,7 +488,6 @@ def est_role_orga(user: discord.Member) -> bool:
 
 
 def extraire_nombre(texte: str):
-    """Tente d'extraire une valeur numérique flottante ou entière depuis un texte."""
     texte_propre = texte.replace(",", ".").replace(" ", "")
     match = re.search(r"[-+]?\d*\.?\d+", texte_propre)
     if match:
@@ -495,17 +498,35 @@ def extraire_nombre(texte: str):
     return None
 
 
+async def charger_questions_depuis_salon(guild: discord.Guild) -> int:
+    """Va lire tous les messages du salon de banque pour actualiser la liste."""
+    global BANQUE_QUESTIONS_DYNAMIQUE
+    salon = guild.get_channel(CHAN_BANQUE_QUESTIONS_ID)
+    if not salon:
+        return 0
+
+    nouvelle_banque = []
+    # Lecture des messages du salon (du plus ancien au plus récent)
+    async for msg in salon.history(limit=200, oldest_first=True):
+        contenu = msg.content.strip()
+        if "|" in contenu and not contenu.startswith("#"):
+            partie_q, partie_r = contenu.split("|", 1)
+            q = partie_q.strip()
+            r = partie_r.strip()
+            if q and r:
+                nouvelle_banque.append((q, r))
+
+    BANQUE_QUESTIONS_DYNAMIQUE = nouvelle_banque
+    return len(BANQUE_QUESTIONS_DYNAMIQUE)
+
+
 async def timer_10_secondes(channel: discord.TextChannel, num_q: int):
-    """Attend 10 secondes puis clôture automatiquement la question avec le podium."""
     await asyncio.sleep(10)
-    # Vérifie que la session active correspond bien toujours à cette question
     if SESSION_VITESSE["actif"] and SESSION_VITESSE["num_question"] == num_q:
         await cloturer_et_publier_resultats(channel)
 
 
-async def demarrer_nouvelle_question(channel: discord.TextChannel, question_str: str, reponse_cible: str, auteur: discord.Member):
-    """Initialise la question, stocke la réponse cible et lance le compte à rebours de 10s."""
-    # Annulation d'un timer précédent si une question était encore en cours
+async def lancer_question_moteur(channel: discord.TextChannel, question_str: str, reponse_cible: str, auteur: discord.Member):
     if SESSION_VITESSE["task_timer"] and not SESSION_VITESSE["task_timer"].done():
         SESSION_VITESSE["task_timer"].cancel()
 
@@ -519,24 +540,22 @@ async def demarrer_nouvelle_question(channel: discord.TextChannel, question_str:
     SESSION_VITESSE["top_depart"] = time.time()
 
     embed = discord.Embed(
-        title=f"⚡ QUESTION #{SESSION_VITESSE['num_question']} — ⏳ 10 SECONDES !",
+        title=f"⚽ QUESTION #{SESSION_VITESSE['num_question']} — ⏳ 10 SECONDES !",
         description=(
             f"# {question_str}\n\n"
             "⏱️ **Vous avez 10 secondes chrono pour répondre dans ce chat !**\n"
-            "🔒 *Vos messages sont masqués automatiquement à la milliseconde.*\n"
-            "🎯 *Le candidat le plus proche l'emporte (départagé au chrono en cas d'égalité).*",
+            "🔒 *Vos messages sont immédiatement masqués pour les autres.*\n"
+            "🎯 *Le plus proche l'emporte (départagé au chrono en cas d'égalité).* "
         ),
         color=discord.Color.red()
     )
     embed.set_footer(text=f"Lancée par {auteur.display_name} • Fin dans 10 secondes pile !")
     await channel.send(embed=embed)
 
-    # Lancement du compte à rebours en tâche d'arrière-plan
     SESSION_VITESSE["task_timer"] = asyncio.create_task(timer_10_secondes(channel, SESSION_VITESSE["num_question"]))
 
 
 async def cloturer_et_publier_resultats(channel: discord.TextChannel):
-    """Arrête les réponses, classe les candidats selon la proximité puis le chrono, et publie le podium."""
     SESSION_VITESSE["actif"] = False
 
     reponses = list(SESSION_VITESSE["reponses_question"].values())
@@ -544,20 +563,16 @@ async def cloturer_et_publier_resultats(channel: discord.TextChannel):
     cible_texte = SESSION_VITESSE["reponse_cible_brute"].lower()
 
     if cible_num is not None:
-        # Tri numérique : le plus proche (écart absolu minimal), puis le plus rapide
-        # Clé de tri : (a-t-il mis un nombre ? [0=oui, 1=non], écart absolu, chrono)
         for r in reponses:
             val = r["val_num"]
             r["ecart"] = abs(val - cible_num) if val is not None else float("inf")
         reponses.sort(key=lambda x: (0 if x["ecart"] != float("inf") else 1, x["ecart"], x["chrono"]))
     else:
-        # Tri textuel : ressemblance maximale (ratio), puis le plus rapide
         for r in reponses:
             ratio = SequenceMatcher(None, cible_texte, r["texte"].lower()).ratio()
             r["ratio"] = ratio
         reponses.sort(key=lambda x: (-x["ratio"], x["chrono"]))
 
-    # Affichage du récapitulatif
     medailles = ["🥇", "🥈", "🥉"]
     lignes = []
     for i, data in enumerate(reponses[:8]):
@@ -567,7 +582,7 @@ async def cloturer_et_publier_resultats(channel: discord.TextChannel):
 
         if cible_num is not None:
             if data["ecart"] != float("inf"):
-                info_ecart = f"Écart : **{data['ecart']:g}**" if data["ecart"] > 0 else "🎯 **PIED PLEIN !**"
+                info_ecart = f"Écart : **{data['ecart']:g}**" if data["ecart"] > 0 else "🎯 **TOUT PILE !**"
                 lignes.append(f"{symbole} **{nom}** — {data['texte']} ({info_ecart} en {chrono_str})")
             else:
                 lignes.append(f"{symbole} **{nom}** — {data['texte']} *(non numérique)* en {chrono_str}")
@@ -575,13 +590,13 @@ async def cloturer_et_publier_resultats(channel: discord.TextChannel):
             pct = int(data["ratio"] * 100)
             lignes.append(f"{symbole} **{nom}** — « {data['texte']} » ({pct}% match en {chrono_str})")
 
-    texte_recap = "\n".join(lignes) if lignes else "*Aucun candidat n'a répondu dans les 10 secondes.*"
+    texte_recap = "\n".join(lignes) if lignes else "*Aucun candidat n'a répondu dans le temps imparti.*"
 
     embed_resultat = discord.Embed(
-        title=f"⌛ TEMPS ÉCOULÉ — RÉSULTATS Q#{SESSION_VITESSE['num_question']}",
+        title=f"⌛ FIN QUESTION #{SESSION_VITESSE['num_question']} — RÉSULTATS",
         description=(
-            f"**Énoncé :** {SESSION_VITESSE['texte_question']}\n"
-            f"🎯 **Réponse officielle :** `{SESSION_VITESSE['reponse_cible_brute']}`\n\n"
+            f"**Énoncé :** {SESSION_VITESSE['texte_question']}\n\n"
+            f"🎯 **Réponse officielle : `{SESSION_VITESSE['reponse_cible_brute']}`**\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{texte_recap}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -591,9 +606,44 @@ async def cloturer_et_publier_resultats(channel: discord.TextChannel):
     await channel.send(embed=embed_resultat)
 
 
+async def action_question_suivante(channel: discord.TextChannel, auteur: discord.Member):
+    global BANQUE_QUESTIONS_DYNAMIQUE
+    if not BANQUE_QUESTIONS_DYNAMIQUE:
+        # Tentative de chargement automatique si la liste est vide
+        nb = await charger_questions_depuis_salon(channel.guild)
+        if nb == 0:
+            await channel.send("❌ **Aucune question trouvée !** Vérifiez que `CHAN_BANQUE_QUESTIONS_ID` est bien configuré et rempli.")
+            return
+
+    idx = SESSION_VITESSE["index_liste"]
+    if idx >= len(BANQUE_QUESTIONS_DYNAMIQUE):
+        await channel.send("🏁 **Toutes les questions du salon ont été posées !** (Tapez `!reset_q` pour recommencer)")
+        return
+
+    q_texte, q_rep = BANQUE_QUESTIONS_DYNAMIQUE[idx]
+    SESSION_VITESSE["index_liste"] += 1
+    await lancer_question_moteur(channel, q_texte, q_rep, auteur)
+
+
 # --------------------------------------------------------
-# INTERCEPTION DU CHAT (!q et RÉPONSES DES CANDIDATS)
+# COMMANDES SLASH & CHAT
 # --------------------------------------------------------
+
+@bot.tree.command(name="charger_banque", description="Actualise la liste des questions depuis le salon Discord dédié.")
+@app_commands.check(est_orga_ou_admin)
+async def charger_banque_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    total = await charger_questions_depuis_salon(interaction.guild)
+    await interaction.followup.send(f"✅ **{total} questions** chargées depuis le salon de banque !", ephemeral=True)
+
+
+@bot.tree.command(name="suivante", description="Envoie automatiquement la question suivante du salon de banque.")
+@app_commands.check(est_orga_ou_admin)
+async def suivante_slash(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    await action_question_suivante(interaction.channel, interaction.user)
+    await interaction.followup.send(f"✅ Question #{SESSION_VITESSE['num_question']} envoyée !", ephemeral=True)
+
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -602,36 +652,58 @@ async def on_message(message: discord.Message):
 
     contenu = message.content.strip()
 
-    # --- A. COMMANDE ORGA : !q QUESTION | REPONSE ---
-    if contenu.lower().startswith("!q ") and isinstance(message.author, discord.Member) and est_role_orga(message.author):
-        corps = contenu[3:].strip()
-        try:
-            await message.delete()  # Masque la question et la réponse pour les candidats
-        except discord.DiscordException:
-            pass
+    # --- 1. COMMANDES RAPIDES ORGA ---
+    if isinstance(message.author, discord.Member) and est_role_orga(message.author):
+        if contenu.lower() in ["!suivante", "!s", "!next"]:
+            try:
+                await message.delete()
+            except discord.DiscordException:
+                pass
+            await action_question_suivante(message.channel, message.author)
+            return
 
-        if "|" in corps:
-            question_texte, reponse_cible = corps.split("|", 1)
-        else:
-            question_texte, reponse_cible = corps, ""
+        if contenu.lower() == "!reset_q":
+            SESSION_VITESSE["index_liste"] = 0
+            try:
+                await message.delete()
+            except discord.DiscordException:
+                pass
+            await message.channel.send("🔄 *Liste de questions réinitialisée au début (Index 0).*", delete_after=3)
+            return
 
-        await demarrer_nouvelle_question(message.channel, question_texte.strip(), reponse_cible.strip(), message.author)
-        return
+        if contenu.lower() == "!charger":
+            try:
+                await message.delete()
+            except discord.DiscordException:
+                pass
+            total = await charger_questions_depuis_salon(message.guild)
+            await message.channel.send(f"✅ **{total} questions** rechargées depuis le salon !", delete_after=4)
+            return
 
-    # --- B. RÉPONSE D'UN CANDIDAT PENDANT LES 10 SECONDES ---
+        if contenu.lower().startswith("!q "):
+            corps = contenu[3:].strip()
+            try:
+                await message.delete()
+            except discord.DiscordException:
+                pass
+            if "|" in corps:
+                q_texte, q_rep = corps.split("|", 1)
+            else:
+                q_texte, q_rep = corps, ""
+            await lancer_question_moteur(message.channel, q_texte.strip(), q_rep.strip(), message.author)
+            return
+
+    # --- 2. RÉPONSE D'UN CANDIDAT (10 SECONDES) ---
     if SESSION_VITESSE["actif"] and message.channel.id == SESSION_VITESSE["channel_id"]:
         if not est_role_orga(message.author):
-            # 1. Suppression instantanée de la réponse
             try:
                 await message.delete()
             except discord.DiscordException as e:
-                print(f"⚠️ Erreur suppression: {e}")
+                print(f"⚠️ Erreur suppression message : {e}")
 
-            # 2. Chrono et calcul
             chrono = time.time() - SESSION_VITESSE["top_depart"]
             uid = message.author.id
 
-            # Une seule proposition par candidat par question
             if uid in SESSION_VITESSE["reponses_question"]:
                 return
 
@@ -644,7 +716,6 @@ async def on_message(message: discord.Message):
                 "val_num": val_num
             }
 
-            # 3. Alerte en temps réel chez les orgas
             salon_orga = message.guild.get_channel(CHAN_LOGS_ORGA_ID)
             if salon_orga:
                 rang = len(SESSION_VITESSE["reponses_question"])
@@ -653,7 +724,7 @@ async def on_message(message: discord.Message):
                     description=(
                         f"**Candidat :** {message.author.mention} (`{message.author.display_name}`)\n"
                         f"**Proposition interceptée :** `{contenu}`\n"
-                        f"**Cible :** `{SESSION_VITESSE['reponse_cible_brute']}`"
+                        f"**Réponse attendue :** `{SESSION_VITESSE['reponse_cible_brute']}`"
                     ),
                     color=discord.Color.green(),
                     timestamp=discord.utils.utcnow()
@@ -663,22 +734,6 @@ async def on_message(message: discord.Message):
             return
 
     await bot.process_commands(message)
-
-
-# Commande de secours si vous devez couper manuellement avant les 10s
-@bot.tree.command(name="stop_vitesse", description="Interrompt les 10 secondes et force l'affichage du podium.")
-@app_commands.check(est_orga_ou_admin)
-async def stop_vitesse(interaction: discord.Interaction):
-    if not SESSION_VITESSE["actif"]:
-        await interaction.response.send_message("Aucune question active.", ephemeral=True)
-        return
-
-    if SESSION_VITESSE["task_timer"] and not SESSION_VITESSE["task_timer"].done():
-        SESSION_VITESSE["task_timer"].cancel()
-
-    await interaction.response.defer(ephemeral=True)
-    await cloturer_et_publier_resultats(interaction.channel)
-    await interaction.followup.send("🛑 Question clôturée manuellement.", ephemeral=True)
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
