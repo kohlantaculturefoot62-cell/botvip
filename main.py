@@ -389,15 +389,20 @@ async def on_ready():
     guild_obj = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild_obj)
     synced = await bot.tree.sync(guild=guild_obj)
-    print(f"{len(synced)} commande(s) slash synchronisée(s) sur le serveur {GUILD_ID}.")
+    print(f"{len(synced)} commande(s) slash synchronisée(s).")
 
+    # Évite les doublons de jobs grâce à id et replace_existing
     scheduler.add_job(
         run_daily_routine,
         trigger=CronTrigger(hour=8, minute=0, timezone="Europe/Paris"),
-        kwargs={"dry_run": False}
+        kwargs={"dry_run": False},
+        id="daily_morning_routine",
+        replace_existing=True
     )
-    scheduler.start()
-    print("Planificateur matinal actif (08:00 Europe/Paris).")
+
+    if not scheduler.running:
+        scheduler.start()
+        print("Planificateur matinal actif (08:00 Europe/Paris).")
 
 
 @bot.tree.command(name="dilemme", description="Lance un dilemme cornélien inédit avec votes en direct")
