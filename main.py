@@ -25,7 +25,7 @@ GUILD_ID = int(os.getenv("GUILD_ID"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_MODEL = "gemini-3.6-flash-lite"
 # Modèle Claude utilisé pour les analyses de jeu (modifiable sans toucher au code via la variable CLAUDE_MODEL).
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 
@@ -175,7 +175,7 @@ class VoiceSummaryView(discord.ui.View):
             await interaction.response.send_message("Impossible de retrouver le vocal d'origine.", ephemeral=True)
             return
 
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             original = await interaction.channel.fetch_message(ref.message_id)
             embed = await summarize_voice_message(original)
@@ -191,7 +191,7 @@ class VoiceSummaryView(discord.ui.View):
             await interaction.followup.send("Aucun vocal trouvé sur ce message.", ephemeral=True)
             return
 
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ==============================================================================
@@ -1619,7 +1619,7 @@ async def context_resume_vocal(interaction: discord.Interaction, message: discor
         await interaction.response.send_message("Ce message ne contient pas de vocal.", ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         embed = await summarize_voice_message(message)
     except Exception as e:
@@ -1627,7 +1627,7 @@ async def context_resume_vocal(interaction: discord.Interaction, message: discor
         await interaction.followup.send("Je n'ai pas réussi à résumer ce vocal, réessaie dans un instant.", ephemeral=True)
         return
 
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ---------- Law and Chaos : gestion de l'état (staff) ----------
