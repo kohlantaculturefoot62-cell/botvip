@@ -545,12 +545,31 @@ async def ask_claude(system: str, user: str, max_tokens: int = 4000) -> str:
     raise ValueError(f"Claude a renvoyé une réponse vide (stop_reason={response.stop_reason}, blocs={kinds}).")
 
 
+def extract_json_objects(text: str) -> list[dict]:
+    """Extrait tous les objets JSON d'une réponse, même s'il y en a plusieurs ou du texte autour (```json ... ``` toléré)."""
+    decoder = json.JSONDecoder()
+    objects, pos = [], 0
+    while True:
+        start = text.find("{", pos)
+        if start == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            pos = start + 1
+            continue
+        if isinstance(obj, dict):
+            objects.append(obj)
+        pos = end
+    return objects
+
+
 def extract_json(text: str) -> dict:
-    """Extrait le premier objet JSON d'une réponse (tolère les ```json ... ```)."""
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError("Aucun JSON dans la réponse de Claude.")
-    return json.loads(match.group(0))
+    """Extrait le premier objet JSON d'une réponse."""
+    objects = extract_json_objects(text)
+    if not objects:
+        raise ValueError("Aucun JSON exploitable dans la réponse de Claude.")
+    return objects[0]
 
 
 def clamp_number(value, default: float, lo: float, hi: float) -> float:
@@ -1046,11 +1065,11 @@ ITW_SINGLE_SYSTEM = ITW_SYSTEM + """
 - Réponds uniquement par la phrase, sans guillemets ni préambule."""
 
 ITW_BATCH_SYSTEM = ITW_SYSTEM + """
-- Le contenu est l'interview d'UN joueur (les questions des hosts peuvent s'y trouver) : identifie-le d'après le contenu et le nom du salon.
+- Le salon contient l'interview d'un ou de plusieurs joueurs (les questions des hosts peuvent s'y trouver) : écris UNE phrase par joueur interviewé, jamais pour un host qui pose les questions. Identifie les joueurs d'après le contenu et le nom du salon.
 
-FORMAT DE SORTIE : réponds UNIQUEMENT par un JSON valide, sans texte autour :
-{"joueur": "<prénom ou pseudo du joueur interviewé, tel qu'écrit dans le salon>", "phrase": "<la phrase>"}
-S'il n'y a aucune interview exploitable : {"joueur": "", "phrase": "AUCUNE_INTERVIEW"}"""
+FORMAT DE SORTIE : réponds UNIQUEMENT par UN SEUL objet JSON valide, sans texte autour :
+{"interviews": [{"joueur": "<prénom ou pseudo, tel qu'écrit dans le salon>", "phrase": "<la phrase>"}]}
+S'il n'y a aucune interview exploitable : {"interviews": []}"""
 
 
 async def read_channel_text(channel, limit: int) -> str:
@@ -1110,8 +1129,8 @@ def itw_hint_from_channel_name(name: str) -> str:
     return re.sub(r"[-_]+", " ", hint).strip()
 
 
-async def generate_channel_line(channel, hint: str, limit: int) -> tuple[str, str]:
-    """Lit un salon d'interview, identifie le joueur interviewé et renvoie (nom tel qu'écrit, phrase)."""
+async def generate_channel_lines(channel, hint: str, limit: int) -> list[tuple[str, str]]:
+    """Lit un salon d'interview(s), identifie les joueurs interviewés et renvoie [(nom tel qu'écrit, phrase)]."""
     transcript = await read_channel_text(channel, limit)
     if not transcript:
         raise ValueError("salon vide")
@@ -1119,51 +1138,65 @@ async def generate_channel_line(channel, hint: str, limit: int) -> tuple[str, st
     hint_line = f"JOUEUR PROBABLEMENT INTERVIEWÉ (d'après le nom du salon) : {hint}\n" if hint else ""
     prompt = f"""SALON : #{channel.name}
 {hint_line}
-CONTENU DU SALON (une interview, éventuellement avec les questions des hosts) :
+CONTENU DU SALON (une ou plusieurs interviews, éventuellement avec les questions des hosts) :
 {transcript}
 
-Identifie le joueur interviewé et écris sa phrase de présentation."""
+Identifie les joueurs interviewés et écris la phrase de présentation de chacun."""
 
-    data = extract_json(await ask_claude(ITW_BATCH_SYSTEM, prompt, max_tokens=600))
-    name = str(data.get("joueur", "")).strip()
-    phrase = str(data.get("phrase", "")).strip().strip('"«»“” ')
-    if not phrase or "AUCUNE_INTERVIEW" in phrase:
+    answer = await ask_claude(ITW_BATCH_SYSTEM, prompt, max_tokens=1000)
+
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for obj in extract_json_objects(answer):
+        items = obj["interviews"] if isinstance(obj.get("interviews"), list) else [obj]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("joueur", "")).strip()
+            phrase = str(item.get("phrase", "")).strip().strip('"«»“” ')
+            if not phrase or "AUCUNE_INTERVIEW" in phrase or (name and norm_name(name) in seen):
+                continue
+            seen.add(norm_name(name))
+            entries.append((name, phrase[:300]))
+    if not entries:
         raise ValueError("aucune interview exploitable")
-    return name, phrase[:300]
+    return entries
 
 
 async def generate_all_interview_lines(guild: discord.Guild, category: discord.CategoryChannel, limit: int) -> list[dict]:
-    """Phrase de présentation pour chaque salon « itw… » de la catégorie (3 appels Claude en parallèle au maximum)."""
+    """Phrases de présentation pour chaque salon « itw… » de la catégorie (3 appels Claude en parallèle au maximum)."""
     resolve = make_member_resolver(guild, load_lc_state()["aliases"])
     channels = [c for c in category.text_channels if is_itw_channel(c.name)]
     semaphore = asyncio.Semaphore(3)
 
-    async def one(channel) -> dict:
-        result = {"channel": channel.name, "name": None, "phrase": None, "error": None}
+    async def one(channel) -> list[dict]:
+        base = {"channel": channel.name, "name": None, "phrase": None, "error": None}
         perms = channel.permissions_for(guild.me)
         if not (perms.view_channel and perms.read_message_history):
-            result["error"] = "je n'ai pas accès à ce salon"
-            return result
+            return [{**base, "error": "je n'ai pas accès à ce salon"}]
 
-        # Joueur : d'abord d'après le nom du salon, sinon d'après ce que Claude lit dans l'interview.
+        # Indice : le nom du salon (« itw-manico »). Claude identifie ensuite les joueurs d'après le contenu.
         hint = itw_hint_from_channel_name(channel.name)
-        member = (resolve(hint) or resolve(hint.split()[0])) if hint else None
+        hint_member = (resolve(hint) or resolve(hint.split()[0])) if hint else None
 
         async with semaphore:
             try:
-                claude_name, phrase = await generate_channel_line(channel, member[1] if member else hint, limit)
+                entries = await generate_channel_lines(channel, hint_member[1] if hint_member else hint, limit)
             except Exception as e:
                 print(f"Erreur phrase itw #{channel.name} : {e}")
-                result["error"] = str(e)
-                return result
+                return [{**base, "error": str(e)}]
 
-        if member is None and claude_name:
-            member = resolve(claude_name)
-        result["name"] = member[1] if member else (claude_name or hint.title() or channel.name)
-        result["phrase"] = phrase
-        return result
+        results = []
+        for claude_name, phrase in entries:
+            member = resolve(claude_name) if claude_name else None
+            if member is None and len(entries) == 1:
+                member = hint_member
+            name = member[1] if member else (claude_name or hint.title() or channel.name)
+            results.append({**base, "name": name, "phrase": phrase})
+        return results
 
-    return list(await asyncio.gather(*(one(c) for c in channels)))
+    nested = await asyncio.gather(*(one(c) for c in channels))
+    return [r for group in nested for r in group]
 
 
 class PublishLineView(discord.ui.View):
@@ -1546,7 +1579,11 @@ async def lc_phrases_itw_tous(interaction: discord.Interaction, messages: app_co
         await interaction.followup.send(f"Aucun salon commençant par « itw » dans la catégorie « {category.name} ».", ephemeral=True)
         return
 
-    done = [r for r in results if r["phrase"]]
+    done, seen = [], set()
+    for r in results:
+        if r["phrase"] and norm_name(r["name"]) not in seen:  # un joueur présent dans deux salons n'apparaît qu'une fois
+            seen.add(norm_name(r["name"]))
+            done.append(r)
     failed = [r for r in results if not r["phrase"]]
     if failed:
         await send_long(interaction, "⚠️ Salons non traités :\n" + "\n".join(f"- #{r['channel']} : {r['error']}" for r in failed))
@@ -1554,7 +1591,7 @@ async def lc_phrases_itw_tous(interaction: discord.Interaction, messages: app_co
         return
 
     public = "🎤 **Les joueurs en une phrase**\n\n" + "\n".join(f"• **{r['name']}** — *{r['phrase']}*" for r in done)
-    await interaction.followup.send(f"Aperçu : {len(done)} phrase(s) sur {len(results)} salon(s), visible par toi seul.", ephemeral=True)
+    await interaction.followup.send(f"Aperçu : {len(done)} phrase(s) pour {len({r['channel'] for r in results})} salon(s), visible par toi seul.", ephemeral=True)
     await send_long(interaction, public)
     await interaction.followup.send(
         f"Publier ces {len(done)} phrases dans ce salon ?",
