@@ -293,6 +293,7 @@ def make_member_resolver(guild: discord.Guild, aliases: dict[str, str] | None = 
     """
     aliases = aliases or {}
     members: dict[int, discord.Member] = {}
+    full_keys_by_member: dict[int, list[str]] = {}
     keys_by_member: dict[int, list[str]] = {}
     for m in guild.members:
         if m.bot:
@@ -300,6 +301,7 @@ def make_member_resolver(guild: discord.Guild, aliases: dict[str, str] | None = 
         members[m.id] = m
         names = [n for n in (m.name, m.display_name, getattr(m, "global_name", None)) if n]
         keys = {norm_name(n) for n in names}
+        full_keys_by_member[m.id] = [k for k in keys if k]
         if m.display_name.split():
             keys.add(norm_name(m.display_name.split()[0]))  # prénom seul
         keys_by_member[m.id] = [k for k in keys if k]
@@ -319,15 +321,18 @@ def make_member_resolver(guild: discord.Guild, aliases: dict[str, str] | None = 
 
         if member is None and key:
             # Du plus strict au plus souple : égalité, début de nom, morceau de nom.
-            matchers = (
-                lambda k: k == key,
-                lambda k: len(key) >= 3 and k.startswith(key),
-                lambda k: len(key) >= 3 and key in k,
+            stages = (
+                lambda mid: key in full_keys_by_member[mid],                                  # nom complet exact
+                lambda mid: key in keys_by_member[mid],                                       # ou prénom seul
+                lambda mid: len(key) >= 3 and any(k.startswith(key) for k in keys_by_member[mid]),  # début de nom
+                lambda mid: len(key) >= 3 and any(key in k for k in keys_by_member[mid]),           # morceau de nom
             )
-            for matches in matchers:
-                candidates = [mid for mid, ks in keys_by_member.items() if any(matches(k) for k in ks)]
+            for stage, matches in enumerate(stages):
+                candidates = [mid for mid in members if matches(mid)]
                 if len(candidates) == 1:
                     member = members[candidates[0]]
+                    if stage >= 2:
+                        resolve.fuzzy[raw] = member.display_name  # correspondance approximative : à signaler
                     break
                 if len(candidates) > 1:
                     resolve.ambiguous[raw] = sorted(members[c].display_name for c in candidates)[:6]
@@ -336,7 +341,34 @@ def make_member_resolver(guild: discord.Guild, aliases: dict[str, str] | None = 
         return (str(member.id), member.display_name) if member else None
 
     resolve.ambiguous = {}
+    resolve.fuzzy = {}
     return resolve
+
+
+def audit_lists(lists: dict[str, dict[str, str]], players: dict[str, str]) -> list[str]:
+    """Contrôles de cohérence : listes complètes, quantités par pièce, répartition croisée, fiches manquantes."""
+    warnings: list[str] = []
+    for oid, lst in lists.items():
+        name = players.get(oid, oid)
+        missing = [players[p] for p in players if p != oid and p not in lst]
+        if missing:
+            warnings.append(f"{name} : absent(s) de sa liste → {', '.join(missing)}")
+        else:
+            counts = Counter(lst.values())
+            for key, spec in PIECES.items():
+                if counts.get(key, 0) != spec["qty"]:
+                    warnings.append(f"{name} : {counts.get(key, 0)}× {spec['label']} au lieu de {spec['qty']}")
+
+    no_list = [players[p] for p in players if p not in lists]
+    if no_list:
+        warnings.append(f"Fiche manquante pour : {', '.join(no_list)} (contrôle croisé des pièces ignoré)")
+    else:
+        for target in players:
+            counts = Counter(lists[o][target] for o in lists if target in lists[o])
+            for key, spec in PIECES.items():
+                if counts.get(key, 0) != spec["qty"]:
+                    warnings.append(f"{players[target]} est {spec['label']} dans {counts.get(key, 0)} liste(s) au lieu de {spec['qty']}")
+    return warnings
 
 
 def parse_lists_payload(payload: dict, resolve) -> tuple[dict, dict, list[str]]:
@@ -356,6 +388,10 @@ def parse_lists_payload(payload: dict, resolve) -> tuple[dict, dict, list[str]]:
                 warnings.append(f"Nom ambigu « {raw} » : {', '.join(candidates)} (utilise /lc_alias)")
             else:
                 warnings.append(f"Joueur introuvable : « {raw} » (utilise /lc_alias si le nom diffère de celui du serveur)")
+        else:
+            guess = getattr(resolve, "fuzzy", {}).get(str(raw))
+            if guess:
+                warnings.append(f"« {raw} » interprété comme {guess} : vérifie, sinon utilise /lc_alias")
         return r
 
     for owner_raw, entries in payload.items():
@@ -376,31 +412,13 @@ def parse_lists_payload(payload: dict, resolve) -> tuple[dict, dict, list[str]]:
                 warnings.append(f"{owner[1]} figure dans sa propre liste (ignoré)")
                 continue
             if target[0] in owner_list:
-                warnings.append(f"{owner[1]} : {target[1]} apparaît deux fois dans la liste")
+                warnings.append(f"{owner[1]} : « {target_raw} » désigne {target[1]}, déjà présent(e) dans cette liste (deux noms de la fiche pointent vers la même personne : utilise /lc_alias)")
                 continue
             owner_list[target[0]] = piece
             players.setdefault(target[0], target[1])
         lists[owner[0]] = owner_list
 
-    # Contrôles de cohérence
-    for oid, lst in lists.items():
-        missing = [players[p] for p in players if p != oid and p not in lst]
-        if missing:
-            warnings.append(f"{players[oid]} : absent(s) de sa liste → {', '.join(missing)}")
-        if not missing:
-            counts = Counter(lst.values())
-            for key, spec in PIECES.items():
-                if counts.get(key, 0) != spec["qty"]:
-                    warnings.append(f"{players[oid]} : {counts.get(key, 0)}× {spec['label']} au lieu de {spec['qty']}")
-
-    if len(lists) == len(players):
-        for target in players:
-            counts = Counter(lists[o][target] for o in lists if target in lists[o])
-            for key, spec in PIECES.items():
-                if counts.get(key, 0) != spec["qty"]:
-                    warnings.append(f"{players[target]} est {spec['label']} dans {counts.get(key, 0)} liste(s) au lieu de {spec['qty']}")
-    else:
-        warnings.append("Certains joueurs cités n'ont pas de liste : contrôle croisé des pièces ignoré.")
+    warnings.extend(audit_lists(lists, players))
 
     return lists, players, list(dict.fromkeys(warnings))
 
@@ -854,14 +872,14 @@ def store_imported_lists(guild: discord.Guild, payload: dict, extra_warnings: li
 
     message = f"✅ {len(lists)} liste(s) importée(s) pour {len(players)} joueurs."
     if warnings:
-        message += f"\n⚠️ {len(warnings)} avertissement(s) :\n" + "\n".join(f"- {w}" for w in warnings[:20])
-        if len(warnings) > 20:
-            message += f"\n… et {len(warnings) - 20} autre(s)."
+        message += f"\n⚠️ {len(warnings)} avertissement(s) :\n" + "\n".join(f"- {w}" for w in warnings[:40])
+        if len(warnings) > 40:
+            message += f"\n… et {len(warnings) - 40} autre(s) : lance /lc_verifier pour la liste complète."
     return message
 
 
 # ==============================================================================
-# 7. LAW AND CHAOS — ANALYSES DU JEU (RÉSUMÉ, CLASSEMENT, BÉNÉFICIAIRES)
+# 7. LAW AND CHAOS — ANALYSES DU JEU (RÉSUMÉ, CLASSEMENT, BÉNÉFICIAIRES, PRONOSTIC)
 # ==============================================================================
 
 # Pondération du classement général (la somme vaut 1).
@@ -1058,6 +1076,96 @@ Réponds UNIQUEMENT par un JSON valide, sans texte autour :
     return "\n\n".join(blocks) + "\n\n*Pourcentage = intérêt estimé à voir ce joueur éliminé (barème des pièces + contexte social). C'est une estimation, pas une probabilité de vote.*"
 
 
+async def analyze_prediction(guild: discord.Guild, messages: int, hours: int) -> str:
+    """Pronostic de l'ordre d'élimination des joueurs en vie, d'après les listes, le barème des pièces et les interviews."""
+    state = load_lc_state()
+    if not state["lists"]:
+        return "Les listes ne sont pas importées : utilise d'abord /lc_importer_salon."
+
+    names = state["players"]
+    alive = alive_ids(state)
+    if len(alive) < 2:
+        return "Il reste moins de 2 joueurs en vie : rien à pronostiquer."
+
+    status = compute_player_status(state)
+    pieces_scores = compute_pieces_scores(state)
+    matrix = benefit_matrix(state, status)
+
+    per_player = []
+    for pid in alive:
+        remaining: dict[str, list[str]] = {}
+        for target, piece in state["lists"].get(pid, {}).items():
+            if target in alive and target != pid:
+                remaining.setdefault(PIECES[piece]["label"], []).append(names[target])
+        row = matrix.get(pid, {})
+        per_player.append({
+            "id": pid,
+            "nom": names[pid],
+            "nominé": pid in state["nominees"],
+            "score_pièces_restantes_0_100": round(pieces_scores.get(pid, {"score": 50})["score"]),
+            "pièces_restantes_(pièce: cibles)": remaining,
+            "effets_déjà_vécus": [PIECES[h["effect"]]["label"] if h["effect"] else "aucun" for h in status[pid]["history"]],
+            "joueurs_qui_gagneraient_à_son_élimination": sum(1 for v in row.values() if v["score"] > 0),
+            "gain_total_à_son_élimination": round(sum(v["score"] for v in row.values() if v["score"] > 0), 1),
+            "joueurs_qui_perdraient_à_son_élimination": sum(1 for v in row.values() if v["score"] < 0),
+        })
+
+    interviews = await collect_interviews(guild, messages)
+    conversations = ""
+    if hours > 0:
+        transcript, stats = await collect_messages(guild, hours, set(state["players"]))
+        if transcript:
+            conversations = (
+                f"\nCONVERSATIONS RÉCENTES ({hours} dernières heures, {stats['total']} messages) :\n"
+                f"Interactions directes :\n{format_pairs(stats, state['players'])}\n\n{transcript}\n"
+            )
+
+    prompt = f"""ÉTAT DE LA PARTIE :
+{build_state_brief(state)}
+
+FAITS CALCULÉS PAR LE BOT À PARTIR DES LISTES SECRÈTES (fiables) :
+{json.dumps(per_player, ensure_ascii=False, indent=1)}
+
+INTERVIEWS DES JOUEURS (propos tenus devant le public : ils peuvent être stratégiques, exagérés ou mensongers ; les questions des hosts peuvent s'y trouver) :
+{interviews or '(aucune interview trouvée)'}
+{conversations}
+MISSION : prédis l'ordre dans lequel les {len(alive)} joueurs EN VIE seront éliminés, du PREMIER éliminé jusqu'au VAINQUEUR (dernier de la liste). Appuie-toi sur :
+- la vulnérabilité mécanique : qui a intérêt à éliminer qui (gains/pertes à l'élimination, pièces restantes) ;
+- la personnalité, le style de jeu et la réputation qui ressortent des interviews ;
+- les alliances et rivalités visibles, s'il y en a.
+Les interviews ne sont qu'un indice : reste prudent quand elles sont rares ou peu informatives, et note-le dans la raison.
+
+Réponds UNIQUEMENT par un JSON valide, sans texte autour, avec CHAQUE joueur en vie exactement une fois (par son "id") :
+{{"ordre":[{{"id":"<id>","confiance":"faible|moyenne|forte","raison":"<20 mots maximum>"}}],"lecture":"<3 phrases maximum : favoris, outsiders, premiers menacés>"}}"""
+
+    answer = await ask_claude(LC_SYSTEM, prompt, max_tokens=4000)
+    data = extract_json(answer)
+
+    ranked, seen = [], set()
+    for item in data.get("ordre", []):
+        if not isinstance(item, dict):
+            continue
+        pid = str(item.get("id", ""))
+        if pid in alive and pid not in seen:
+            seen.add(pid)
+            ranked.append((pid, item))
+    unranked = [pid for pid in alive if pid not in seen]
+
+    lines = [f"**🔮 Pronostic des éliminations** — {len(alive)} joueurs en vie, du prochain éliminé au vainqueur"]
+    for idx, (pid, item) in enumerate(ranked, 1):
+        icon = "🏆" if idx == len(ranked) and not unranked else f"{idx}."
+        confiance = f" *(confiance {item['confiance']})*" if item.get("confiance") in ("faible", "moyenne", "forte") else ""
+        lines.append(f"{icon} **{names[pid]}** — {item.get('raison', '—')}{confiance}")
+    if unranked:
+        lines.append(f"\n⚠️ Non classés par Claude : {', '.join(names[p] for p in unranked)}. Relance la commande.")
+    if data.get("lecture"):
+        lines.append(f"\n💬 {data['lecture']}")
+    if not interviews:
+        lines.append("\nℹ️ Aucune interview trouvée (catégorie ITW_CATEGORY_ID) : le pronostic repose seulement sur les listes.")
+    lines.append("\n*Estimation de Claude d'après les listes, le barème des pièces et les interviews : aucune certitude.*")
+    return "\n".join(lines)
+
+
 # ==============================================================================
 # 8. PHRASE DE PRÉSENTATION D'UN JOUEUR D'APRÈS SON INTERVIEW (CLAUDE)
 # ==============================================================================
@@ -1132,6 +1240,40 @@ CONTENU DU SALON D'INTERVIEWS (il peut contenir les interviews de plusieurs joue
     if not lines:
         raise ValueError("Claude n'a renvoyé aucune phrase.")
     return lines[0].strip().strip('"«»“” ')[:300]
+
+
+async def collect_interviews(guild: discord.Guild, limit: int, per_channel_chars: int = 8000, max_chars: int = 150_000) -> str:
+    """Texte des salons « itw… » de la catégorie des interviews, une section par salon (vide si rien n'est lisible)."""
+    category = guild.get_channel(ITW_CATEGORY_ID)
+    if not isinstance(category, discord.CategoryChannel):
+        return ""
+
+    channels = []
+    for c in category.text_channels:
+        perms = c.permissions_for(guild.me)
+        if is_itw_channel(c.name) and perms.view_channel and perms.read_message_history:
+            channels.append(c)
+
+    semaphore = asyncio.Semaphore(5)
+
+    async def one(channel) -> str:
+        async with semaphore:
+            try:
+                text = await read_channel_text(channel, limit)
+            except Exception as e:
+                print(f"Erreur lecture interview #{channel.name} : {e}")
+                return ""
+        return f"=== SALON #{channel.name} ===\n{text[-per_channel_chars:]}" if text else ""
+
+    sections, total = [], 0
+    for section in await asyncio.gather(*(one(c) for c in channels)):
+        if not section:
+            continue
+        total += len(section)
+        if total > max_chars:
+            break
+        sections.append(section)
+    return "\n\n".join(sections)
 
 
 def is_itw_channel(name: str) -> bool:
@@ -1509,6 +1651,23 @@ async def lc_liste(interaction: discord.Interaction, joueur: discord.Member):
     await interaction.response.send_message(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
+@bot.tree.command(name="lc_verifier", description="[Staff] Vérifie que les listes importées sont complètes et cohérentes")
+@app_commands.guild_only()
+@staff_only()
+async def lc_verifier(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    state = load_lc_state()
+    if not state["lists"]:
+        await interaction.followup.send("Aucune liste importée : utilise /lc_importer_salon.", ephemeral=True)
+        return
+    issues = audit_lists(state["lists"], state["players"])
+    head = f"{len(state['lists'])} liste(s) pour {len(state['players'])} joueur(s) détecté(s)."
+    if issues:
+        await send_long(interaction, f"{head}\n⚠️ {len(issues)} problème(s) :\n" + "\n".join(f"- {i}" for i in issues))
+    else:
+        await send_long(interaction, f"{head}\n✅ Toutes les listes sont complètes et les pièces bien réparties.")
+
+
 # ---------- Law and Chaos : analyses (staff) ----------
 
 @bot.tree.command(name="lc_resume", description="[Staff] Résumé des dynamiques de jeu sur les dernières heures")
@@ -1627,6 +1786,24 @@ async def lc_phrases_itw_tous(interaction: discord.Interaction, messages: app_co
         view=PublishLineView(split_text(public)),
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="lc_pronostic", description="[Staff] Prédit l'ordre d'élimination d'après les listes et les interviews")
+@app_commands.describe(
+    messages="Derniers messages lus par salon d'interview (défaut 300)",
+    heures="Ajoute aussi les conversations des X dernières heures (0 = non, défaut)",
+)
+@app_commands.guild_only()
+@staff_only()
+async def lc_pronostic(interaction: discord.Interaction, messages: app_commands.Range[int, 20, 1000] = 300, heures: app_commands.Range[int, 0, 72] = 0):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        result = await analyze_prediction(interaction.guild, messages, heures)
+    except Exception as e:
+        print(f"Erreur /lc_pronostic : {e}")
+        await interaction.followup.send("Le pronostic a échoué (API Claude, JSON invalide ou lecture des salons). Réessaie ou regarde les logs.", ephemeral=True)
+        return
+    await send_long(interaction, result)
 
 
 if __name__ == "__main__":
