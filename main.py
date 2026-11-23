@@ -11,7 +11,7 @@ from typing import Optional
 from dotenv import load_dotenv
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from google import genai
@@ -1642,6 +1642,10 @@ async def on_ready():
     synced = await bot.tree.sync(guild=guild_obj)
     print(f"{len(synced)} commande(s) slash synchronisée(s).")
 
+    # Scan des duos en arrière-plan : le premier passage part tout de suite, puis toutes les DUO_REFRESH_MINUTES.
+    if not duo_refresh_loop.is_running():
+        duo_refresh_loop.start()
+
 
 @bot.tree.context_menu(name="Résumer le vocal")
 async def context_resume_vocal(interaction: discord.Interaction, message: discord.Message):
@@ -2263,27 +2267,41 @@ async def eliminer_candidat(interaction: discord.Interaction, role_candidat: dis
 
 
 # ==============================================================================
-# 11. SUGGESTION DE DUO À LIRE (SPECTATEURS ET ORGAS)
+# 11. SUGGESTION DE DUO À LIRE (SPECTATEURS ET ORGAS) — INDEX MIS À JOUR EN ARRIÈRE-PLAN
 # ==============================================================================
 
-DUO_WINDOW_HOURS = 24          # fenêtre pour mesurer l'activité d'un duo
-DUO_MIN_MESSAGES = 3           # en dessous, le duo n'est pas jugé "assez actif" (sauf s'il n'y a rien d'autre)
-DUO_CACHE_TTL = 600            # secondes : on ne relit pas tous les salons à chaque !duo
-DUO_COOLDOWN = 8               # secondes entre deux !duo d'une même personne
-DUO_REPLY_LIFETIME = 120       # le message du bot disparaît pour ne pas polluer le salon
+DUO_INDEX_FILE = Path("duo_index.json")
+DUO_WINDOW_HOURS = 24            # fenêtre pour mesurer l'activité d'un duo
+DUO_MIN_MESSAGES = 10            # en dessous, le duo n'est pas jugé intéressant
+DUO_REFRESH_MINUTES = 20         # fréquence du scan en arrière-plan
+DUO_RESUMMARIZE_AFTER = 6        # nouveaux messages avant de refaire le petit résumé d'un duo
+DUO_MAX_SUMMARIES_PER_RUN = 12   # borne le coût Gemini à chaque passage
+DUO_COOLDOWN = 5                 # secondes entre deux !duo d'une même personne
+DUO_REPLY_LIFETIME = 120         # le message du bot disparaît pour ne pas polluer le salon
 
-duo_cache: dict = {"ts": 0.0, "data": []}
-duo_cache_lock = asyncio.Lock()
-duo_seen: dict[int, list[int]] = {}      # {user_id: derniers duos proposés}
+duo_refresh_lock = asyncio.Lock()
+duo_recent: dict[int, list[int]] = {}   # {user_id: derniers duos proposés}
 duo_last_call: dict[int, float] = {}
 
+DUO_SUMMARY_PROMPT = (
+    "Voici les derniers messages d'un salon privé où deux candidats d'un jeu d'élimination discutent, lus par des spectateurs. "
+    "Écris UNE seule phrase (25 mots maximum), en français, qui donne envie d'aller lire la discussion : le sujet ou l'ambiance "
+    "(complicité, tension, négociation, rigolade, suspicion...). Reste fidèle à ce qui est écrit, sans citation, sans inventer.\n"
+    "Réponds uniquement par la phrase.\n\nMESSAGES :\n"
+)
+
 DUO_TEMPLATES = [
-    "👀 Jette un œil à {mention} : **{names}** ont l'air bien lancés ({n} messages ces dernières {h} h).",
-    "🍿 Ça bouge chez **{names}** ! Va lire {mention} ({n} messages récents).",
-    "🔥 Duo à suivre : {mention} avec **{names}**. {n} messages depuis hier, y'a de quoi lire.",
-    "🕵️ Petite recommandation : {mention} (**{names}**). Ça discute pas mal en ce moment !",
-    "💬 **{names}** sont en pleine discussion dans {mention}. Prends ton popcorn ({n} messages).",
-    "✨ Tu devrais aller voir {mention} : **{names}** échangent beaucoup ces derniers temps.",
+    "👀 Jette un œil à {mention} avec **{names}** : {summary}",
+    "🍿 Ça bouge chez **{names}** ! {summary} → {mention}",
+    "🔥 Duo à suivre : {mention} (**{names}**). {summary}",
+    "🕵️ Petite recommandation : {mention} (**{names}**). {summary}",
+    "💬 **{names}** dans {mention} : {summary}",
+    "✨ Tu devrais aller voir {mention} : **{names}**. {summary}",
+]
+DUO_TEMPLATES_NO_SUMMARY = [
+    "👀 Jette un œil à {mention} : **{names}** discutent beaucoup en ce moment.",
+    "🍿 Ça bouge chez **{names}** ! Va lire {mention}.",
+    "🔥 Duo à suivre : {mention} (**{names}**), il s'y passe des choses.",
 ]
 
 
@@ -2294,26 +2312,68 @@ def can_use_duo(member: discord.abc.User) -> bool:
     return isinstance(member, discord.Member) and any(r.name == ROLE_SPECTATEURS_NAME for r in member.roles)
 
 
-def pick_duo(pool: list[dict], seen: list[int], rng=random) -> Optional[dict]:
-    """Choisit un duo actif au hasard, pondéré par l'activité, en évitant ceux déjà proposés à cette personne."""
-    active = [d for d in pool if d["count"] >= DUO_MIN_MESSAGES] or [d for d in pool if d["count"] > 0]
-    if not active:
+def load_duo_index() -> dict:
+    if DUO_INDEX_FILE.exists():
+        try:
+            data = json.loads(DUO_INDEX_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "duos" in data and "queue" in data:
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"updated": None, "queue": [], "duos": {}}
+
+
+def save_duo_index(index: dict) -> None:
+    try:
+        DUO_INDEX_FILE.write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        print(f"Impossible d'écrire {DUO_INDEX_FILE} : {e}")
+
+
+duo_index: dict = load_duo_index()
+
+
+def merge_queue(old_queue: list[str], interesting_by_activity: list[str]) -> list[str]:
+    """Garde l'ordre actuel des duos toujours intéressants ; les nouveaux (déjà triés du plus actif au moins actif) passent devant."""
+    wanted = set(interesting_by_activity)
+    kept = [i for i in old_queue if i in wanted]
+    new = [i for i in interesting_by_activity if i not in set(kept)]
+    return new + kept
+
+
+def take_next(queue: list[str], visible: set[str], recent: list[str], rng=random) -> tuple[Optional[str], list[str]]:
+    """Prend le premier duo de la file que la personne peut voir et n'a pas eu récemment,
+    puis le remet au milieu ou tout en bas de la file."""
+    candidates = [i for i in queue if i in visible]
+    if not candidates:
+        return None, queue
+    chosen = next((i for i in candidates if i not in recent), candidates[0])
+    rest = [i for i in queue if i != chosen]
+    position = rng.choice([len(rest) // 2, len(rest)])
+    rest.insert(position, chosen)
+    return chosen, rest
+
+
+async def summarize_duo_channel(channel: discord.TextChannel, cutoff: datetime) -> Optional[str]:
+    """Petit résumé d'une phrase des échanges récents d'un duo (Gemini)."""
+    lines = []
+    async for m in channel.history(after=cutoff, limit=60, oldest_first=True):
+        if m.author.bot or not m.content:
+            continue
+        lines.append(f"{m.author.display_name} : {m.content[:300]}")
+    if not lines:
         return None
-    fresh = [d for d in active if d["id"] not in seen]
-    if not fresh:  # tous déjà vus : on repart de zéro
-        seen.clear()
-        fresh = active
-    weights = [d["count"] ** 0.5 for d in fresh]
-    return rng.choices(fresh, weights=weights, k=1)[0]
+    text = "\n".join(lines)[-6000:]
+    response = await ai_client.aio.models.generate_content(model=GEMINI_MODEL, contents=DUO_SUMMARY_PROMPT + text)
+    summary = (response.text or "").strip().strip('"').replace("\n", " ")
+    return summary[:220] or None
 
 
-async def compute_duo_activity(guild: discord.Guild) -> list[dict]:
-    """Liste des duos actifs (salons à exactement 2 rôles de candidats) avec leur nombre de messages récents."""
-    now = asyncio.get_event_loop().time()
-    async with duo_cache_lock:
-        if duo_cache["data"] and now - duo_cache["ts"] < DUO_CACHE_TTL:
-            return duo_cache["data"]
-
+async def refresh_duo_index(guild: discord.Guild) -> None:
+    """Scanne les duos, mesure leur activité, met à jour les petits résumés et reconstruit la file."""
+    if duo_refresh_lock.locked():
+        return
+    async with duo_refresh_lock:
         role_spectateurs = discord.utils.get(guild.roles, name=ROLE_SPECTATEURS_NAME)
         role_orgas = guild.get_role(JUGES_SUPREMES_ID)
         ignored = {guild.default_role.id}
@@ -2329,9 +2389,9 @@ async def compute_duo_activity(guild: discord.Guild) -> list[dict]:
                 duos.append((channel, names))
 
         cutoff = datetime.now(timezone.utc) - timedelta(hours=DUO_WINDOW_HOURS)
-        sem = asyncio.Semaphore(5)
+        sem = asyncio.Semaphore(4)
 
-        async def measure(channel: discord.TextChannel, names: list[str]) -> dict:
+        async def measure(channel: discord.TextChannel) -> int:
             count = 0
             async with sem:
                 try:
@@ -2340,29 +2400,80 @@ async def compute_duo_activity(guild: discord.Guild) -> list[dict]:
                             count += 1
                 except discord.HTTPException:
                     pass
-            return {"id": channel.id, "channel": channel, "names": names, "count": count}
+            return count
 
-        data = await asyncio.gather(*(measure(c, n) for c, n in duos))
-        duo_cache["data"] = list(data)
-        duo_cache["ts"] = now
-        return duo_cache["data"]
+        counts = await asyncio.gather(*(measure(c) for c, _ in duos))
+
+        old = duo_index["duos"]
+        new_duos: dict[str, dict] = {}
+        to_summarize = []
+        for (channel, names), count in zip(duos, counts):
+            if count < DUO_MIN_MESSAGES:
+                continue
+            key = str(channel.id)
+            prev = old.get(key, {})
+            entry = {"names": names, "count": count, "summary": prev.get("summary"), "summarized_at_count": prev.get("summarized_at_count", 0)}
+            new_duos[key] = entry
+            if entry["summary"] is None or count - entry["summarized_at_count"] >= DUO_RESUMMARIZE_AFTER or count < entry["summarized_at_count"]:
+                to_summarize.append((channel, entry))
+
+        # Les plus actifs d'abord pour les résumés (budget limité par passage).
+        to_summarize.sort(key=lambda item: item[1]["count"], reverse=True)
+        for channel, entry in to_summarize[:DUO_MAX_SUMMARIES_PER_RUN]:
+            try:
+                summary = await summarize_duo_channel(channel, cutoff)
+            except Exception as e:
+                print(f"[duo] résumé impossible pour #{channel.name} : {e}")
+                continue
+            if summary:
+                entry["summary"] = summary
+                entry["summarized_at_count"] = entry["count"]
+            await asyncio.sleep(0.5)
+
+        by_activity = sorted(new_duos, key=lambda k: new_duos[k]["count"], reverse=True)
+        duo_index["duos"] = new_duos
+        duo_index["queue"] = merge_queue(duo_index["queue"], by_activity)
+        duo_index["updated"] = datetime.now(timezone.utc).isoformat()
+        save_duo_index(duo_index)
+        print(f"[duo] index mis à jour : {len(new_duos)} duo(s) intéressant(s) sur {len(duos)}.")
 
 
-async def suggest_duo(guild: discord.Guild, member: discord.Member) -> str:
-    data = await compute_duo_activity(guild)
-    # On ne propose que des salons que la personne peut réellement ouvrir.
-    pool = [d for d in data if d["channel"].permissions_for(member).view_channel]
-    seen = duo_seen.setdefault(member.id, [])
-    choice = pick_duo(pool, seen)
-    if choice is None:
+@tasks.loop(minutes=DUO_REFRESH_MINUTES)
+async def duo_refresh_loop():
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    try:
+        await refresh_duo_index(guild)
+    except Exception as e:
+        print(f"[duo] erreur de rafraîchissement : {e}")
+
+
+def suggest_duo(guild: discord.Guild, member: discord.Member) -> str:
+    """Réponse instantanée : lit uniquement l'index déjà préparé."""
+    if not duo_index["queue"]:
+        if duo_refresh_lock.locked() or duo_index["updated"] is None:
+            return "⏳ Je prépare ma liste de duos, réessaie dans une minute !"
         return "😴 Aucun duo n'a été très actif ces dernières heures. Reviens un peu plus tard !"
-    seen.append(choice["id"])
-    return random.choice(DUO_TEMPLATES).format(
-        mention=choice["channel"].mention,
-        names=" & ".join(choice["names"]) or "ces deux candidats",
-        n=choice["count"],
-        h=DUO_WINDOW_HOURS,
-    )
+
+    visible = {
+        key for key in duo_index["queue"]
+        if (ch := guild.get_channel(int(key))) is not None and ch.permissions_for(member).view_channel
+    }
+    recent = duo_recent.setdefault(member.id, [])
+    chosen, duo_index["queue"] = take_next(duo_index["queue"], visible, recent)
+    if chosen is None:
+        return "😴 Je n'ai aucun duo à te proposer pour le moment."
+    recent.append(chosen)
+    del recent[:-3]
+    save_duo_index(duo_index)
+
+    entry = duo_index["duos"].get(chosen, {})
+    channel = guild.get_channel(int(chosen))
+    names = " & ".join(entry.get("names", [])) or "ces deux candidats"
+    if entry.get("summary"):
+        return random.choice(DUO_TEMPLATES).format(mention=channel.mention, names=names, summary=entry["summary"])
+    return random.choice(DUO_TEMPLATES_NO_SUMMARY).format(mention=channel.mention, names=names)
 
 
 @bot.listen("on_message")
@@ -2380,14 +2491,8 @@ async def on_duo_command(message: discord.Message):
         return
     duo_last_call[message.author.id] = now
 
-    async with message.channel.typing():
-        try:
-            text = await suggest_duo(message.guild, message.author)
-        except Exception as e:
-            print(f"Erreur !duo : {e}")
-            text = "Je n'ai pas réussi à trouver un duo, réessaie dans un instant."
-    await message.reply(text, mention_author=False, delete_after=DUO_REPLY_LIFETIME,
-                        allowed_mentions=discord.AllowedMentions.none())
+    await message.reply(suggest_duo(message.guild, message.author), mention_author=False,
+                        delete_after=DUO_REPLY_LIFETIME, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="duo", description="Te propose un duo actif à aller lire (spectateurs et orgas)")
@@ -2396,13 +2501,16 @@ async def duo_slash(interaction: discord.Interaction):
     if not can_use_duo(interaction.user):
         await interaction.response.send_message("⛔ Réservé aux spectateurs et aux orgas.", ephemeral=True)
         return
+    await interaction.response.send_message(suggest_duo(interaction.guild, interaction.user), ephemeral=True)
+
+
+@bot.tree.command(name="duo_rafraichir", description="[Staff] Relance tout de suite le scan des duos actifs")
+@app_commands.guild_only()
+@staff_only()
+async def duo_rafraichir(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        text = await suggest_duo(interaction.guild, interaction.user)
-    except Exception as e:
-        print(f"Erreur /duo : {e}")
-        text = "Je n'ai pas réussi à trouver un duo, réessaie dans un instant."
-    await interaction.followup.send(text, ephemeral=True)
+    await refresh_duo_index(interaction.guild)
+    await interaction.followup.send(f"✅ Index des duos mis à jour : {len(duo_index['queue'])} duo(s) dans la liste.", ephemeral=True)
 
 
 if __name__ == "__main__":
