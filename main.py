@@ -1166,7 +1166,7 @@ Réponds UNIQUEMENT par un JSON valide, sans texte autour :
     return "\n\n".join(blocks) + "\n\n*Pourcentage = intérêt estimé à voir ce joueur éliminé (barème des pièces + contexte social). C'est une estimation, pas une probabilité de vote.*"
 
 
-async def analyze_prediction(guild: discord.Guild, messages: int, hours: int) -> str:
+async def analyze_prediction(guild: discord.Guild, messages: int, hours: int, public: bool = False) -> str:
     """Pronostic de l'ordre d'élimination des joueurs en vie, d'après les listes, le barème des pièces et les interviews."""
     state = load_lc_state()
     if not state["lists"]:
@@ -1211,6 +1211,21 @@ async def analyze_prediction(guild: discord.Guild, messages: int, hours: int) ->
                 f"Interactions directes :\n{format_pairs(stats, state['players'])}\n\n{transcript}\n"
             )
 
+    public_rules = ""
+    if public:
+        public_rules = (
+            "\nCONTRAINTE : ce pronostic sera PUBLIÉ devant tous les joueurs. Tes raisons et ta lecture ne doivent JAMAIS mentionner, "
+            "ni laisser deviner, les listes secrètes, les pièces, leurs effets ou qui a un intérêt mécanique à éliminer qui. "
+            "Appuie-toi uniquement sur ce qui est visible de tous : personnalité, style de jeu, interviews, comportements. "
+            "Ton léger et bienveillant, jamais blessant.\n"
+        )
+    else:
+        public_rules = (
+            "\nCONTEXTE : ce pronostic est réservé à l'ORGANISATION (aucun joueur ne le verra). Utilise ABSOLUMENT TOUT ce que tu as : "
+            "listes secrètes, pièces restantes et leurs effets, gains/pertes à l'élimination, interviews, conversations, alliances, "
+            "rivalités, risque d'être ciblé. Sois franc et précis dans tes raisons, sans langue de bois, et cite les mécaniques de jeu quand elles expliquent le rang.\n"
+        )
+
     prompt = f"""ÉTAT DE LA PARTIE :
 {build_state_brief(state)}
 
@@ -1226,7 +1241,7 @@ MISSION : prédis l'ordre dans lequel les {len(alive)} joueurs EN VIE seront él
 - les alliances et rivalités visibles, s'il y en a.
 Les interviews ne sont qu'un indice : reste prudent quand elles sont rares ou peu informatives, et note-le dans la raison.
 Désigne chaque joueur par son "code" (J1, J2…), jamais par son nom. Chacun des {len(alive)} joueurs doit apparaître exactement une fois.
-
+{public_rules}
 Réponds UNIQUEMENT par un JSON valide, sans texte autour :
 {{"ordre":[{{"code":"<code>","confiance":"faible|moyenne|forte","raison":"<20 mots maximum>"}}],"lecture":"<3 phrases maximum : favoris, outsiders, premiers menacés>"}}"""
 
@@ -1244,6 +1259,8 @@ Réponds UNIQUEMENT par un JSON valide, sans texte autour :
     unranked = [pid for pid in alive if pid not in seen]
     if unranked:
         print(f"[pronostic] {len(ranked)}/{len(alive)} joueurs classés. Réponse brute : {answer[:800]}")
+        if public:
+            raise ValueError("Claude n'a pas classé tous les joueurs : rien n'a été publié. Relance la commande.")
 
     lines = [f"**🔮 Pronostic des éliminations** — {len(alive)} joueurs en vie, du prochain éliminé au vainqueur"]
     for idx, (pid, item) in enumerate(ranked, 1):
@@ -1254,9 +1271,12 @@ Réponds UNIQUEMENT par un JSON valide, sans texte autour :
         lines.append(f"\n⚠️ Non classés par Claude : {', '.join(names[p] for p in unranked)}. Relance la commande.")
     if data.get("lecture"):
         lines.append(f"\n💬 {data['lecture']}")
-    if not interviews:
-        lines.append("\nℹ️ Aucune interview trouvée (catégorie ITW_CATEGORY_ID) : le pronostic repose seulement sur les listes.")
-    lines.append("\n*Estimation de Claude d'après les listes, le barème des pièces et les interviews : aucune certitude.*")
+    if public:
+        lines.append("\n*Pronostic généré par Claude d'après la personnalité et le jeu de chacun. Pour le fun : rien n'est écrit d'avance !*")
+    else:
+        if not interviews:
+            lines.append("\nℹ️ Aucune interview trouvée (catégorie ITW_CATEGORY_ID) : le pronostic repose seulement sur les listes.")
+        lines.append("\n*Estimation de Claude d'après les listes, le barème des pièces et les interviews : aucune certitude.*")
     return "\n".join(lines)
 
 
@@ -1949,18 +1969,39 @@ async def lc_phrases_itw_tous(interaction: discord.Interaction, messages: app_co
 @app_commands.describe(
     messages="Derniers messages lus par salon d'interview (défaut 300)",
     heures="Ajoute aussi les conversations des X dernières heures (0 = non, défaut)",
+    publier="Publie le pronostic directement dans ce salon (par défaut : salon orga, Claude utilise tout)",
+    salon_joueurs="Avec publier : le salon est vu des joueurs, donc aucune info secrète sur les listes",
 )
 @app_commands.guild_only()
 @staff_only()
-async def lc_pronostic(interaction: discord.Interaction, messages: app_commands.Range[int, 20, 1000] = 300, heures: app_commands.Range[int, 0, 72] = 0):
+async def lc_pronostic(
+    interaction: discord.Interaction,
+    messages: app_commands.Range[int, 20, 1000] = 300,
+    heures: app_commands.Range[int, 0, 72] = 0,
+    publier: bool = False,
+    salon_joueurs: bool = False,
+):
+    # Salon orga : on exploite aussi les conversations des dernières 24 h si rien n'est précisé
+    if publier and not salon_joueurs and heures == 0:
+        heures = 24
+    # Toujours une réponse privée : les erreurs ne sont jamais visibles des joueurs, même en mode publication.
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        result = await analyze_prediction(interaction.guild, messages, heures)
+        result = await analyze_prediction(interaction.guild, messages, heures, public=(publier and salon_joueurs))
+    except ValueError as e:
+        await interaction.followup.send(str(e), ephemeral=True)
+        return
     except Exception as e:
         print(f"Erreur /lc_pronostic : {e}")
         await interaction.followup.send("Le pronostic a échoué (API Claude, JSON invalide ou lecture des salons). Réessaie ou regarde les logs.", ephemeral=True)
         return
-    await send_long(interaction, result)
+
+    if publier:
+        for chunk in split_text(result):
+            await interaction.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+        await interaction.followup.send("✅ Pronostic publié dans ce salon.", ephemeral=True)
+    else:
+        await send_long(interaction, result)
 
 
 @bot.tree.command(name="lc_candidats", description="[Staff] Récupère les candidats d'après les salons itw et les compare aux listes")
