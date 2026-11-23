@@ -260,6 +260,7 @@ def load_lc_state() -> dict:
     state.setdefault("nominees", [])      # [id]
     state.setdefault("eliminations", [])  # [{"round": n, "player": id, "at": iso}]
     state.setdefault("aliases", {})       # {nom normalisé écrit dans les fiches: id du membre}
+    state.setdefault("candidates", {})    # {id: nom} des candidats trouvés dans les salons itw (vide = tous les joueurs des listes)
     return state
 
 
@@ -271,9 +272,15 @@ def save_lc_state(state: dict):
     tmp.replace(LC_STATE_FILE)
 
 
+def roster_ids(state: dict) -> list[str]:
+    """Joueurs de la partie : ceux des listes, restreints aux candidats des salons itw quand ils ont été enregistrés."""
+    candidates = state.get("candidates") or {}
+    return [pid for pid in state["players"] if not candidates or pid in candidates]
+
+
 def alive_ids(state: dict) -> list[str]:
     eliminated = {e["player"] for e in state["eliminations"]}
-    return [pid for pid in state["players"] if pid not in eliminated]
+    return [pid for pid in roster_ids(state) if pid not in eliminated]
 
 
 def strip_accents(text: str) -> str:
@@ -686,6 +693,49 @@ def format_pairs(stats: dict, state_names: dict[str, str], top: int = 40) -> str
     return "\n".join(lines) if lines else "(aucune mention ni réponse directe détectée)"
 
 
+def make_player_codes(pids: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Codes courts J1, J2… : bien plus fiables à recopier pour Claude que des identifiants Discord de 18 chiffres."""
+    code_to_pid = {f"J{i}": pid for i, pid in enumerate(pids, 1)}
+    return code_to_pid, {pid: code for code, pid in code_to_pid.items()}
+
+
+def item_ref(item: dict):
+    """Référence de joueur donnée par Claude dans un objet JSON (code, id, nom… selon ce qu'il a choisi d'écrire)."""
+    for key in ("code", "id", "joueur", "nom"):
+        if item.get(key) not in (None, ""):
+            return item[key]
+    return None
+
+
+def match_player(ref, code_to_pid: dict[str, str], names: dict[str, str], valid: set[str]) -> str | None:
+    """Retrouve un joueur à partir d'un code (J12), d'un identifiant Discord ou d'un nom, parmi les joueurs valides."""
+    if ref is None:
+        return None
+    ref = str(ref).strip()
+    pid = code_to_pid.get(ref.upper())
+    if pid in valid:
+        return pid
+    if ref in valid:
+        return ref
+    key = norm_name(ref)
+    if key:
+        for candidate in valid:
+            if norm_name(names.get(candidate, "")) == key:
+                return candidate
+    return None
+
+
+def find_json_with_key(text: str, key: str) -> dict:
+    """Premier objet JSON de la réponse qui contient la clé attendue (à défaut, le premier objet JSON)."""
+    objects = extract_json_objects(text)
+    for obj in objects:
+        if key in obj:
+            return obj
+    if objects:
+        return objects[0]
+    raise ValueError("Aucun JSON exploitable dans la réponse de Claude.")
+
+
 def build_state_brief(state: dict) -> str:
     """Résumé de l'état de la partie pour les prompts."""
     if not state["players"]:
@@ -889,7 +939,7 @@ W_ALLIANCE, W_PIECES, W_SAFETY = 0.35, 0.30, 0.35
 async def analyze_summary(guild: discord.Guild, hours: int) -> str:
     """Résumé des dynamiques de jeu sur les dernières heures."""
     state = load_lc_state()
-    transcript, stats = await collect_messages(guild, hours, set(state["players"]) or None)
+    transcript, stats = await collect_messages(guild, hours, set(roster_ids(state)) or None)
     if stats["total"] == 0:
         return f"Aucun message de joueur trouvé sur les {hours} dernières heures."
 
@@ -919,14 +969,15 @@ async def analyze_ranking(guild: discord.Guild, hours: int) -> tuple[str, str]:
     """Classement des joueurs en vie : alliances (Claude), pièces restantes (calcul), risque d'être ciblé (Claude + calcul)."""
     state = load_lc_state()
     if not state["lists"]:
-        return "Les listes ne sont pas importées : utilise d'abord /lc_importer_listes.", ""
+        return "Les listes ne sont pas importées : utilise d'abord /lc_importer_salon.", ""
 
     names = state["players"]
     alive = alive_ids(state)
+    code_to_pid, pid_to_code = make_player_codes(alive)
     status = compute_player_status(state)
     pieces_scores = compute_pieces_scores(state)
     matrix = benefit_matrix(state, status)
-    transcript, stats = await collect_messages(guild, hours, set(state["players"]))
+    transcript, stats = await collect_messages(guild, hours, set(roster_ids(state)))
 
     per_player = []
     for pid in alive:
@@ -936,7 +987,7 @@ async def analyze_ranking(guild: discord.Guild, hours: int) -> tuple[str, str]:
                 remaining.setdefault(PIECES[piece]["label"], []).append(names[target])
         gains = [v["score"] for v in matrix.get(pid, {}).values() if v["score"] > 0]
         per_player.append({
-            "id": pid,
+            "code": pid_to_code[pid],
             "nom": names[pid],
             "nominé": pid in state["nominees"],
             "messages": stats["per_author"].get(pid, 0),
@@ -963,13 +1014,21 @@ MISSION : pour CHAQUE joueur en vie, donne deux notes de 0 à 100 :
 - "risque" : probabilité que d'autres veuillent l'éliminer (hostilité exprimée, perçu comme menace, intérêt mécanique des autres à l'éliminer d'après "joueurs_qui_gagneraient_à_son_élimination", nomination). 100 = très menacé.
 Ajoute un "commentaire" de 25 mots maximum.
 Si un joueur a peu parlé, base-toi surtout sur les données calculées et note ton incertitude dans le commentaire.
+Désigne chaque joueur par son "code" (J1, J2…), jamais par son nom.
 
 Réponds UNIQUEMENT par un JSON valide, sans texte autour :
-{{"joueurs":[{{"id":"<id>","alliance":<0-100>,"risque":<0-100>,"commentaire":"<texte>"}}]}}"""
+{{"joueurs":[{{"code":"<code>","alliance":<0-100>,"risque":<0-100>,"commentaire":"<texte>"}}]}}"""
 
-    answer = await ask_claude(LC_SYSTEM, prompt, max_tokens=5000)
-    data = extract_json(answer)
-    items = {str(j["id"]): j for j in data.get("joueurs", []) if isinstance(j, dict) and "id" in j}
+    answer = await ask_claude(LC_SYSTEM, prompt, max_tokens=6000)
+    data = find_json_with_key(answer, "joueurs")
+    items: dict[str, dict] = {}
+    for j in data.get("joueurs", []):
+        if isinstance(j, dict):
+            pid = match_player(item_ref(j), code_to_pid, names, set(alive))
+            if pid:
+                items[pid] = j
+    if len(items) < len(alive):
+        print(f"[classement] {len(items)}/{len(alive)} joueurs reconnus. Réponse brute : {answer[:800]}")
 
     rows = []
     for pid in alive:
@@ -993,6 +1052,9 @@ Réponds UNIQUEMENT par un JSON valide, sans texte autour :
         f"Sûr = 100 − risque d'être ciblé. Total = {W_ALLIANCE:.0%} Alli + {W_PIECES:.0%} Pièc + {W_SAFETY:.0%} Sûr.\n"
         "```\n" + "\n".join(table) + "\n```"
     )
+    not_rated = [names[p] for p in alive if p not in items]
+    if not_rated:
+        header += f"\n⚠️ Non évalués par Claude (notes neutres de 50 pour alliance et risque) : {', '.join(not_rated)}"
     comments = "\n".join(f"**{rank}. {names[pid]}** — {comment}" for rank, (_, pid, _, _, _, comment) in enumerate(rows, 1))
     return header, comments
 
@@ -1001,15 +1063,17 @@ async def analyze_beneficiaries(guild: discord.Guild, hours: int) -> str:
     """Pour chaque nominé : qui bénéficierait de son élimination (en %), calculé sur les listes puis ajusté par le contexte social."""
     state = load_lc_state()
     if not state["lists"]:
-        return "Les listes ne sont pas importées : utilise d'abord /lc_importer_listes."
+        return "Les listes ne sont pas importées : utilise d'abord /lc_importer_salon."
     if not state["nominees"]:
         return "Aucun nominé enregistré : utilise /lc_nominer."
 
     names = state["players"]
+    alive = alive_ids(state)
+    code_to_pid, pid_to_code = make_player_codes(alive)
     status = compute_player_status(state)
-    nominees = [n for n in state["nominees"] if n in alive_ids(state)]
+    nominees = [n for n in state["nominees"] if n in alive]
     matrix = benefit_matrix(state, status, nominees)
-    transcript, stats = await collect_messages(guild, hours, set(state["players"]))
+    transcript, stats = await collect_messages(guild, hours, set(roster_ids(state)))
 
     # Base mécanique : 50 % neutre, +12 points par point de bénéfice (entre 5 % et 95 %).
     base: dict[str, dict[str, float]] = {
@@ -1018,9 +1082,9 @@ async def analyze_beneficiaries(guild: discord.Guild, hours: int) -> str:
 
     mechanics = [
         {
-            "nominé": {"id": t, "nom": names[t]},
+            "nominé": {"code": pid_to_code[t], "nom": names[t]},
             "joueurs": [
-                {"id": o, "nom": names[o], "effet": describe_effect(v["piece"], v["effect"]), "base_%": round(base[t][o])}
+                {"code": pid_to_code[o], "nom": names[o], "effet": describe_effect(v["piece"], v["effect"]), "base_%": round(base[t][o])}
                 for o, v in row.items()
             ],
         }
@@ -1039,22 +1103,32 @@ INTERACTIONS DIRECTES ({hours} dernières heures) :
 TRANSCRIPTION ({stats['total']} messages) :
 {transcript or '(aucun message)'}
 
-MISSION : à partir du contexte social uniquement (alliances, rivalités, promesses de vote, discours sur les nominés), propose pour les joueurs concernés un "ajustement" en points de pourcentage entre -25 et +25 à ajouter au base_% (ex : +15 si le joueur est un allié du nominé donc moins intéressé à le voir partir malgré l'effet, ou en conflit ouvert avec lui). Ne liste que les joueurs pour lesquels le contexte justifie un ajustement non nul (les autres restent à 0). Ajoute une "lecture" de 2 phrases maximum par nominé sur qui a le plus intérêt à ce qu'il parte.
+MISSION : à partir du contexte social uniquement (alliances, rivalités, promesses de vote, discours sur les nominés), propose pour les joueurs concernés un "ajustement" en points de pourcentage entre -25 et +25 à ajouter au base_% (ex : +15 si le joueur est en conflit ouvert avec le nominé, -15 s'il en est un allié proche malgré l'effet). Ne liste que les joueurs pour lesquels le contexte justifie un ajustement non nul (les autres restent à 0). Ajoute une "lecture" de 2 phrases maximum par nominé sur qui a le plus intérêt à ce qu'il parte.
+Désigne chaque joueur par son "code" (J1, J2…), jamais par son nom.
 
 Réponds UNIQUEMENT par un JSON valide, sans texte autour :
-{{"nomines":[{{"id":"<id du nominé>","ajustements":[{{"id":"<id joueur>","ajustement":<-25..25>,"raison":"<20 mots max>"}}],"lecture":"<texte>"}}]}}"""
+{{"nomines":[{{"code":"<code du nominé>","ajustements":[{{"code":"<code du joueur>","ajustement":<-25..25>,"raison":"<20 mots max>"}}],"lecture":"<texte>"}}]}}"""
 
     answer = await ask_claude(LC_SYSTEM, prompt, max_tokens=4000)
-    data = extract_json(answer)
-    by_nominee = {str(n["id"]): n for n in data.get("nomines", []) if isinstance(n, dict) and "id" in n}
+    data = find_json_with_key(answer, "nomines")
+    by_nominee: dict[str, dict] = {}
+    for n in data.get("nomines", []):
+        if isinstance(n, dict):
+            t = match_player(item_ref(n), code_to_pid, names, set(nominees))
+            if t:
+                by_nominee[t] = n
+    if len(by_nominee) < len(nominees):
+        print(f"[bénéficiaires] {len(by_nominee)}/{len(nominees)} nominés reconnus. Réponse brute : {answer[:800]}")
 
     blocks = []
     for t, row in matrix.items():
         info = by_nominee.get(t, {})
-        adjustments = {
-            str(a["id"]): (clamp_number(a.get("ajustement"), 0, -25, 25), str(a.get("raison", "")))
-            for a in info.get("ajustements", []) if isinstance(a, dict) and "id" in a
-        }
+        adjustments: dict[str, tuple[float, str]] = {}
+        for a in info.get("ajustements", []):
+            if isinstance(a, dict):
+                pid = match_player(item_ref(a), code_to_pid, names, set(row))
+                if pid:
+                    adjustments[pid] = (clamp_number(a.get("ajustement"), 0, -25, 25), str(a.get("raison", "")))
         final = {}
         for o, v in row.items():
             adj, reason = adjustments.get(o, (0.0, ""))
@@ -1087,6 +1161,7 @@ async def analyze_prediction(guild: discord.Guild, messages: int, hours: int) ->
     if len(alive) < 2:
         return "Il reste moins de 2 joueurs en vie : rien à pronostiquer."
 
+    code_to_pid, pid_to_code = make_player_codes(alive)
     status = compute_player_status(state)
     pieces_scores = compute_pieces_scores(state)
     matrix = benefit_matrix(state, status)
@@ -1099,7 +1174,7 @@ async def analyze_prediction(guild: discord.Guild, messages: int, hours: int) ->
                 remaining.setdefault(PIECES[piece]["label"], []).append(names[target])
         row = matrix.get(pid, {})
         per_player.append({
-            "id": pid,
+            "code": pid_to_code[pid],
             "nom": names[pid],
             "nominé": pid in state["nominees"],
             "score_pièces_restantes_0_100": round(pieces_scores.get(pid, {"score": 50})["score"]),
@@ -1113,7 +1188,7 @@ async def analyze_prediction(guild: discord.Guild, messages: int, hours: int) ->
     interviews = await collect_interviews(guild, messages)
     conversations = ""
     if hours > 0:
-        transcript, stats = await collect_messages(guild, hours, set(state["players"]))
+        transcript, stats = await collect_messages(guild, hours, set(roster_ids(state)))
         if transcript:
             conversations = (
                 f"\nCONVERSATIONS RÉCENTES ({hours} dernières heures, {stats['total']} messages) :\n"
@@ -1134,22 +1209,25 @@ MISSION : prédis l'ordre dans lequel les {len(alive)} joueurs EN VIE seront él
 - la personnalité, le style de jeu et la réputation qui ressortent des interviews ;
 - les alliances et rivalités visibles, s'il y en a.
 Les interviews ne sont qu'un indice : reste prudent quand elles sont rares ou peu informatives, et note-le dans la raison.
+Désigne chaque joueur par son "code" (J1, J2…), jamais par son nom. Chacun des {len(alive)} joueurs doit apparaître exactement une fois.
 
-Réponds UNIQUEMENT par un JSON valide, sans texte autour, avec CHAQUE joueur en vie exactement une fois (par son "id") :
-{{"ordre":[{{"id":"<id>","confiance":"faible|moyenne|forte","raison":"<20 mots maximum>"}}],"lecture":"<3 phrases maximum : favoris, outsiders, premiers menacés>"}}"""
+Réponds UNIQUEMENT par un JSON valide, sans texte autour :
+{{"ordre":[{{"code":"<code>","confiance":"faible|moyenne|forte","raison":"<20 mots maximum>"}}],"lecture":"<3 phrases maximum : favoris, outsiders, premiers menacés>"}}"""
 
-    answer = await ask_claude(LC_SYSTEM, prompt, max_tokens=4000)
-    data = extract_json(answer)
+    answer = await ask_claude(LC_SYSTEM, prompt, max_tokens=6000)
+    data = find_json_with_key(answer, "ordre")
 
     ranked, seen = [], set()
     for item in data.get("ordre", []):
         if not isinstance(item, dict):
             continue
-        pid = str(item.get("id", ""))
-        if pid in alive and pid not in seen:
+        pid = match_player(item_ref(item), code_to_pid, names, set(alive))
+        if pid and pid not in seen:
             seen.add(pid)
             ranked.append((pid, item))
     unranked = [pid for pid in alive if pid not in seen]
+    if unranked:
+        print(f"[pronostic] {len(ranked)}/{len(alive)} joueurs classés. Réponse brute : {answer[:800]}")
 
     lines = [f"**🔮 Pronostic des éliminations** — {len(alive)} joueurs en vie, du prochain éliminé au vainqueur"]
     for idx, (pid, item) in enumerate(ranked, 1):
@@ -1355,6 +1433,68 @@ async def generate_all_interview_lines(guild: discord.Guild, category: discord.C
 
     nested = await asyncio.gather(*(one(c) for c in channels))
     return [r for group in nested for r in group]
+
+
+async def main_author_of(channel) -> list[tuple[str, str]]:
+    """Auteur non-staff le plus actif d'un salon (dernier recours pour savoir qui est interviewé)."""
+    counts: Counter = Counter()
+    names: dict[str, str] = {}
+    try:
+        async for msg in channel.history(limit=200):
+            author = msg.author
+            if author.bot or is_staff_member(author):
+                continue
+            counts[str(author.id)] += 1
+            names[str(author.id)] = author.display_name
+    except Exception as e:
+        print(f"Erreur lecture #{channel.name} : {e}")
+        return []
+    if not counts:
+        return []
+    pid = counts.most_common(1)[0][0]
+    return [(pid, names[pid])]
+
+
+async def find_candidates(guild: discord.Guild) -> tuple[dict[str, str], list[tuple[str, list[str], str]]]:
+    """
+    Candidats = les joueurs des salons « itw… » de la catégorie des interviews.
+    Pour chaque salon : accès individuel au salon, sinon nom du salon (itw-manico), sinon auteur principal.
+    Renvoie ({id: nom}, [(salon, [noms], source)]).
+    """
+    category = guild.get_channel(ITW_CATEGORY_ID)
+    if not isinstance(category, discord.CategoryChannel):
+        raise ValueError("Catégorie des interviews introuvable (variable ITW_CATEGORY_ID).")
+
+    resolve = make_member_resolver(guild, load_lc_state()["aliases"])
+    found: dict[str, str] = {}
+    report: list[tuple[str, list[str], str]] = []
+
+    for channel in category.text_channels:
+        if not is_itw_channel(channel.name):
+            continue
+
+        access = [
+            (str(target.id), target.display_name)
+            for target, overwrite in channel.overwrites.items()
+            if isinstance(target, discord.Member) and not target.bot and overwrite.view_channel is True and not is_staff_member(target)
+        ]
+        hint = itw_hint_from_channel_name(channel.name)
+        hinted = (resolve(hint) or resolve(hint.split()[0])) if hint else None
+
+        if access and hinted and hinted[0] not in {a[0] for a in access}:
+            chosen, source = access, "accès au salon (le nom du salon désigne quelqu'un d'autre)"
+        elif hinted:
+            chosen, source = [hinted], "nom du salon" + (" + accès" if access else "")
+        elif access:
+            chosen, source = access, "accès au salon"
+        else:
+            chosen, source = await main_author_of(channel), "auteur principal"
+
+        for pid, name in chosen:
+            found[pid] = name
+        report.append((channel.name, [n for _, n in chosen], source))
+
+    return found, report
 
 
 class PublishLineView(discord.ui.View):
@@ -1804,6 +1944,53 @@ async def lc_pronostic(interaction: discord.Interaction, messages: app_commands.
         await interaction.followup.send("Le pronostic a échoué (API Claude, JSON invalide ou lecture des salons). Réessaie ou regarde les logs.", ephemeral=True)
         return
     await send_long(interaction, result)
+
+
+@bot.tree.command(name="lc_candidats", description="[Staff] Récupère les candidats d'après les salons itw et les compare aux listes")
+@app_commands.describe(appliquer="Enregistre ce résultat comme liste officielle des candidats (sinon : simple aperçu)")
+@app_commands.guild_only()
+@staff_only()
+async def lc_candidats(interaction: discord.Interaction, appliquer: bool = False):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        found, report = await find_candidates(interaction.guild)
+    except ValueError as e:
+        await interaction.followup.send(str(e), ephemeral=True)
+        return
+    except Exception as e:
+        print(f"Erreur /lc_candidats : {e}")
+        await interaction.followup.send("La recherche a échoué, regarde les logs.", ephemeral=True)
+        return
+
+    if not report:
+        await interaction.followup.send("Aucun salon commençant par « itw » dans la catégorie des interviews.", ephemeral=True)
+        return
+
+    state = load_lc_state()
+    lines = [f"**👥 {len(found)} candidat(s) trouvé(s) dans {len(report)} salon(s) itw**"]
+    for channel_name, members, source in report:
+        lines.append(f"- #{channel_name} → {', '.join(members) if members else '❓ non identifié'} ({source})")
+
+    without_list = [name for pid, name in found.items() if pid not in state["players"]]
+    outside_itw = [name for pid, name in state["players"].items() if pid not in found]
+    if state["players"]:
+        if without_list:
+            lines.append(f"\n⚠️ Dans les salons itw mais **sans fiche** importée : {', '.join(without_list)}")
+        if outside_itw:
+            lines.append(f"\n⚠️ Dans les listes mais **pas dans les salons itw** : {', '.join(outside_itw)}")
+        if not without_list and not outside_itw:
+            lines.append("\n✅ Les candidats des salons itw correspondent exactement aux joueurs des listes.")
+
+    if appliquer:
+        if not found:
+            lines.append("\nAucun candidat identifié : rien n'a été enregistré.")
+        else:
+            state["candidates"] = found
+            save_lc_state(state)
+            lines.append(f"\n✅ Candidats enregistrés : les analyses ne portent plus que sur ces {len(found)} joueurs.")
+    else:
+        lines.append("\nRelance avec `appliquer:True` pour enregistrer cette liste comme liste officielle des candidats.")
+    await send_long(interaction, "\n".join(lines))
 
 
 if __name__ == "__main__":
