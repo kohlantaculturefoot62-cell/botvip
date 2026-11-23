@@ -500,6 +500,22 @@ def describe_effect(piece: str, effect: str | None) -> str:
     return f"{PIECES[effect]['label']} (via {PIECES[piece]['label']}) → {PIECES[effect]['effet']}"
 
 
+def format_player_list(state: dict, pid: str) -> str | None:
+    """Liste d'un joueur, pièce par pièce (les joueurs déjà éliminés sont barrés). None si elle n'est pas importée."""
+    owner_list = state["lists"].get(pid)
+    if not owner_list:
+        return None
+    names = state["players"]
+    eliminated = {e["player"] for e in state["eliminations"]}
+    lines = [f"🔒 **Liste de {names.get(pid, pid)}** (barré = déjà éliminé)"]
+    for key, spec in PIECES.items():
+        targets = [t for t, p in owner_list.items() if p == key]
+        if targets:
+            shown = ", ".join(f"~~{names.get(t, t)}~~" if t in eliminated else names.get(t, t) for t in targets)
+            lines.append(f"**{spec['label']}** : {shown}")
+    return "\n".join(lines)
+
+
 # ==============================================================================
 # 5. LAW AND CHAOS — COLLECTE DES CONVERSATIONS ET APPELS À CLAUDE
 # ==============================================================================
@@ -1478,6 +1494,19 @@ async def lc_alias(interaction: discord.Interaction, nom: str, joueur: discord.M
     state["aliases"][key] = str(joueur.id)
     save_lc_state(state)
     await interaction.response.send_message(f"✅ « {nom} » désignera désormais {joueur.display_name}. Relance /lc_importer_salon pour appliquer.", ephemeral=True)
+
+
+@bot.tree.command(name="lc_liste", description="[Staff] Affiche la liste de pièces d'un joueur")
+@app_commands.describe(joueur="Joueur dont tu veux voir la liste")
+@app_commands.guild_only()
+@staff_only()
+async def lc_liste(interaction: discord.Interaction, joueur: discord.Member):
+    state = load_lc_state()
+    text = format_player_list(state, str(joueur.id))
+    if text is None:
+        await interaction.response.send_message(f"Aucune liste enregistrée pour {joueur.display_name} : utilise /lc_importer_salon.", ephemeral=True)
+        return
+    await interaction.response.send_message(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 # ---------- Law and Chaos : analyses (staff) ----------
