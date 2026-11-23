@@ -60,16 +60,19 @@ HISTORY_FILE = Path("dilemmas_history.json")
 # ==============================================================================
 
 VOICE_SUMMARY_PROMPT = """
-Tu reçois un message vocal envoyé sur un serveur Discord entre amis.
+Tu reçois un message vocal envoyé sur un serveur Discord entre amis. Tu dois en faire un résumé fidèle, complet et agréable à lire, à la place de celui qui l'a envoyé.
 
-Écoute-le en entier puis réponds STRICTEMENT dans ce format (sans autre texte) :
+Écoute-le en entier (hésitations, ton, ironie, blagues compris) puis réponds STRICTEMENT dans ce format (sans autre texte) :
 
-RÉSUMÉ: [1 à 3 phrases qui donnent l'essentiel : ce que la personne veut dire, demande ou annonce]
-POINTS CLÉS: [liste à puces "- ..." de 2 à 5 éléments, UNIQUEMENT si le vocal est long ou contient plusieurs infos distinctes, sinon écris "-"]
+RÉSUMÉ: [2 à 4 phrases qui rendent l'essentiel : ce que je veux dire, demande, annonce ou raconte, et dans quel état d'esprit (enthousiaste, agacé, ironique, hésitant...) si c'est perceptible]
+POINTS CLÉS: [liste à puces "- ..." de 2 à 6 éléments, UNIQUEMENT si le vocal est long ou contient plusieurs infos distinctes, sinon écris "-"]
 
 Consignes :
-- Écris en français, au style indirect ("Il/Elle dit que...", "Il/Elle demande si..."), sans inventer le genre si tu ne peux pas le déduire : utilise alors une tournure neutre.
-- Reste fidèle au contenu : n'ajoute aucune information absente du vocal.
+- Écris en français et À LA PREMIÈRE PERSONNE, comme si c'était moi (la personne du vocal) qui résumais mon propre message : "Je dis que...", "Je propose de...", "Je me demande si...". Jamais "la personne", "il" ou "elle", et ne déduis ni n'écris jamais mon genre : tournure neutre quand un accord serait nécessaire.
+- Garde tous les détails qui comptent : noms de personnes ou de joueurs cités, chiffres, dates, heures, lieux, décisions, questions posées, demandes faites à quelqu'un, désaccords.
+- Si je pose une question ou demande quelque chose à quelqu'un, dis-le clairement dans le résumé.
+- Reste fidèle au contenu : n'ajoute aucune information, interprétation ou jugement absents du vocal. Ne mets pas de citations entre guillemets sauf pour un mot ou une expression marquante.
+- Si le vocal est dans une autre langue, résume-le quand même en français.
 - Si l'audio est inaudible, vide ou sans parole, écris à la place de RÉSUMÉ : "Aucune parole exploitable dans ce vocal." et "-" pour les points clés.
 """
 
@@ -192,6 +195,47 @@ class VoiceSummaryView(discord.ui.View):
             return
 
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ---------- Traduction (Gemini) ----------
+
+TRANSLATE_PROMPT = (
+    "Traduis le message ci-dessous en français naturel, fidèle au ton (familier, humour, argot) et sans rien ajouter. "
+    "Conserve tel quel les mentions (<@...>), les emojis, les liens et la mise en forme Markdown. "
+    "Si le message est déjà entièrement en français, réponds uniquement par : DEJA_FR\n"
+    "Sinon, réponds au format exact :\nLANGUE: <langue d'origine, en français>\nTRADUCTION:\n<texte traduit>\n\n"
+    "MESSAGE :\n"
+)
+
+
+def message_text_to_translate(message: discord.Message) -> str:
+    """Texte du message + texte des embeds éventuels."""
+    parts = [message.content or ""]
+    for emb in message.embeds:
+        for chunk in (emb.title, emb.description):
+            if chunk:
+                parts.append(chunk)
+    return "\n".join(p for p in parts if p).strip()
+
+
+async def translate_to_french(text: str) -> tuple[str | None, str | None]:
+    """Retourne (langue d'origine, traduction), ou (None, None) si le texte est déjà en français."""
+    response = await ai_client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=TRANSLATE_PROMPT + text[:6000],
+    )
+    answer = (response.text or "").strip()
+    if not answer:
+        raise ValueError("Gemini n'a renvoyé aucune traduction.")
+    if answer.upper().startswith("DEJA_FR"):
+        return None, None
+    lang = "?"
+    translation = answer
+    if "TRADUCTION:" in answer:
+        head, translation = answer.split("TRADUCTION:", 1)
+        if "LANGUE:" in head:
+            lang = head.split("LANGUE:", 1)[1].strip() or "?"
+    return lang, translation.strip()
 
 
 # ==============================================================================
@@ -1599,19 +1643,6 @@ async def on_ready():
     print(f"{len(synced)} commande(s) slash synchronisée(s).")
 
 
-@bot.listen("on_message")
-async def on_voice_message(message: discord.Message):
-    """Détecte les vocaux et propose le bouton « Résumer »."""
-    if message.author.bot or message.guild is None or message.guild.id != GUILD_ID:
-        return
-
-    # Seuls les vrais messages vocaux Discord déclenchent le bouton (pas les fichiers audio classiques).
-    if not message.flags.voice or get_voice_attachment(message) is None:
-        return
-
-    await message.reply("🎙️ Pas le temps d'écouter ?", view=VoiceSummaryView(), mention_author=False)
-
-
 @bot.tree.context_menu(name="Résumer le vocal")
 async def context_resume_vocal(interaction: discord.Interaction, message: discord.Message):
     """Clic droit sur un vocal > Applications > Résumer le vocal."""
@@ -1627,6 +1658,31 @@ async def context_resume_vocal(interaction: discord.Interaction, message: discor
         await interaction.followup.send("Je n'ai pas réussi à résumer ce vocal, réessaie dans un instant.", ephemeral=True)
         return
 
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.context_menu(name="Traduire en français")
+async def context_traduire(interaction: discord.Interaction, message: discord.Message):
+    """Clic droit sur un message > Applications > Traduire en français (visible seulement par toi)."""
+    text = message_text_to_translate(message)
+    if not text:
+        await interaction.response.send_message("Ce message ne contient pas de texte à traduire.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        lang, translation = await translate_to_french(text)
+    except Exception as e:
+        print(f"Erreur traduction : {e}")
+        await interaction.followup.send("Je n'ai pas réussi à traduire ce message, réessaie dans un instant.", ephemeral=True)
+        return
+
+    if translation is None:
+        await interaction.followup.send("Ce message est déjà en français 🇫🇷", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="🌍 Traduction", description=translation[:4000], color=discord.Color.blurple())
+    embed.set_footer(text=f"Message de {message.author.display_name} • {lang} → français")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -2049,6 +2105,161 @@ async def lc_candidats(interaction: discord.Interaction, appliquer: bool = False
     else:
         lines.append("\nRelance avec `appliquer:True` pour enregistrer cette liste comme liste officielle des candidats.")
     await send_long(interaction, "\n".join(lines))
+
+
+# ==============================================================================
+# 10. ARCHIVAGE DES SALONS D'UN CANDIDAT ÉLIMINÉ
+# ==============================================================================
+
+ROLE_SPECTATEURS_NAME = os.getenv("ROLE_SPECTATEURS_NAME", "Spectateurs")
+NOM_CATEGORIE_ARCHIVE = os.getenv("NOM_CATEGORIE_ARCHIVE", "📦 Archives")
+MAX_CHANNELS_PER_CATEGORY = 50  # limite Discord
+# Un salon n'est traité que s'il réunit entre 2 et MAX_GROUP_SIZE candidats : écarte les salons perso et les salons communs (#général…).
+MAX_GROUP_SIZE = int(os.getenv("MAX_GROUP_SIZE", "10"))
+ARCHIVED_PREFIX = "🔒arch-"
+
+
+def nettoyer_texte(text: str) -> str:
+    """Minuscules, sans accents ni emojis/ponctuation : sert à retrouver les catégories d'archive."""
+    return re.sub(r"[^a-z0-9]+", "", strip_accents(text).lower())
+
+
+def get_spectateur_overwrites() -> discord.PermissionOverwrite:
+    return discord.PermissionOverwrite(
+        read_messages=True, view_channel=True, read_message_history=True,
+        send_messages=False, add_reactions=False,
+    )
+
+
+def est_orga_ou_admin():
+    """Admins et Juges Suprêmes (les orgas)."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        return is_staff_member(interaction.user)
+    return app_commands.check(predicate)
+
+
+def channel_candidate_role_ids(channel: discord.abc.GuildChannel, ignored_ids: set[int], extra_ids: set[int] = frozenset()) -> set[int]:
+    """Rôles de candidats qui voient le salon.
+
+    On écarte @everyone, spectateurs, orgas, les rôles de bots/admins et les rôles collectifs (plus d'un membre) :
+    un rôle de candidat n'a qu'un seul porteur. Les rôles de `extra_ids` (le candidat éliminé) sont toujours gardés.
+    """
+    ids = set()
+    for target, overwrite in channel.overwrites.items():
+        if not isinstance(target, discord.Role) or target.id in ignored_ids:
+            continue
+        if target.id not in extra_ids:
+            if target.managed or target.permissions.administrator or len(target.members) > 1:
+                continue
+        if overwrite.view_channel is True or overwrite.read_messages is True:
+            ids.add(target.id)
+    return ids
+
+
+def plan_channel_action(participants: set[int], candidate_id: int, other_sets: list[set[int]]) -> str:
+    """Décide ce qu'on fait d'un salon contenant le candidat éliminé.
+
+    - 'archive' : duo ou trio (3 participants ou moins) ;
+    - 'archive_doublon' : quatuor+ dont le groupe restant existe déjà dans un autre salon actif ;
+    - 'retirer' : quatuor+ dont le groupe restant n'existe pas encore : on retire seulement le candidat.
+    """
+    if len(participants) <= 3:
+        return "archive"
+    remaining = participants - {candidate_id}
+    if any(other == remaining for other in other_sets):
+        return "archive_doublon"
+    return "retirer"
+
+
+@bot.tree.command(
+    name="eliminer_candidat",
+    description="Archive les salons duo/trio d'un candidat éliminé et le retire des salons à 4+ (sauf doublon).",
+)
+@app_commands.describe(role_candidat="Le rôle du candidat éliminé (ex: @Lucas)")
+@app_commands.guild_only()
+@est_orga_ou_admin()
+async def eliminer_candidat(interaction: discord.Interaction, role_candidat: discord.Role):
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+
+    role_spectateurs = discord.utils.get(guild.roles, name=ROLE_SPECTATEURS_NAME)
+    role_orgas = guild.get_role(JUGES_SUPREMES_ID)
+    ignored_ids = {guild.default_role.id}
+    ignored_ids.update(r.id for r in (role_spectateurs, role_orgas) if r)
+
+    # Tous les salons de groupe actifs et leurs participants (rôles de candidats).
+    groups: dict[int, tuple[discord.TextChannel, set[int]]] = {}
+    for channel in guild.channels:
+        if isinstance(channel, discord.CategoryChannel) or channel.name.startswith(ARCHIVED_PREFIX):
+            continue
+        ids = channel_candidate_role_ids(channel, ignored_ids, {role_candidat.id})
+        if 2 <= len(ids) <= MAX_GROUP_SIZE:  # écarte les salons perso (1 rôle) et les salons communs
+            groups[channel.id] = (channel, ids)
+
+    targeted = [(ch, ids) for ch, ids in groups.values() if role_candidat.id in ids]
+    if not targeted:
+        await interaction.followup.send(f"ℹ️ Aucun salon de groupe actif trouvé pour le rôle {role_candidat.mention}.", ephemeral=True)
+        return
+
+    # Les duos/trios d'abord (archivage direct), puis les groupes plus grands.
+    targeted.sort(key=lambda item: len(item[1]))
+
+    clean_arch_name = nettoyer_texte(NOM_CATEGORIE_ARCHIVE)
+    archive_categories = [c for c in guild.categories if clean_arch_name in nettoyer_texte(c.name)]
+    current_archive_cat = archive_categories[-1] if archive_categories else await guild.create_category(NOM_CATEGORIE_ARCHIVE)
+    cat_index = len(archive_categories) or 1
+    in_current_cat = len(current_archive_cat.channels)
+
+    archived, trimmed, duplicates = [], [], []
+
+    for channel, participants in targeted:
+        others = [ids for cid, (_, ids) in groups.items() if cid != channel.id]
+        action = plan_channel_action(participants, role_candidat.id, others)
+
+        if action == "retirer":
+            await channel.set_permissions(role_candidat, overwrite=None, reason=f"Élimination du candidat {role_candidat.name}")
+            groups[channel.id] = (channel, participants - {role_candidat.id})
+            trimmed.append(channel)
+            await asyncio.sleep(0.6)
+            continue
+
+        if in_current_cat >= MAX_CHANNELS_PER_CATEGORY:
+            cat_index += 1
+            current_archive_cat = await guild.create_category(f"{NOM_CATEGORIE_ARCHIVE} - {cat_index}")
+            in_current_cat = 0
+            await asyncio.sleep(1)
+
+        new_overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False, view_channel=False),
+            guild.me: discord.PermissionOverwrite(read_messages=True, view_channel=True, send_messages=True),
+        }
+        if role_spectateurs:
+            new_overwrites[role_spectateurs] = get_spectateur_overwrites()
+        if role_orgas:
+            new_overwrites[role_orgas] = discord.PermissionOverwrite(
+                read_messages=True, view_channel=True, read_message_history=True, send_messages=False
+            )
+
+        await channel.edit(
+            name=f"{ARCHIVED_PREFIX}{channel.name}"[:100],
+            category=current_archive_cat,
+            overwrites=new_overwrites,
+            reason=f"Élimination du candidat {role_candidat.name}",
+        )
+        groups.pop(channel.id, None)  # n'est plus un salon actif
+        in_current_cat += 1
+        (duplicates if action == "archive_doublon" else archived).append(channel)
+        await asyncio.sleep(0.6)
+
+    lines = [f"🏆 **Élimination enregistrée :** {role_candidat.mention}"]
+    if archived:
+        lines.append(f"📦 **{len(archived)} salon(s) duo/trio archivé(s)** dans **{current_archive_cat.name}**.")
+    if duplicates:
+        lines.append(f"📦 **{len(duplicates)} salon(s) à 4+ archivé(s)** car le groupe restant existe déjà : {', '.join(f'`{c.name}`' for c in duplicates)}")
+    if trimmed:
+        lines.append(f"✂️ **{len(trimmed)} salon(s) à 4+ conservé(s)** (candidat retiré, groupe restant inédit) : {', '.join(c.mention for c in trimmed)}")
+    lines.append("🔒 Le candidat n'a plus accès à ces salons.")
+    await interaction.followup.send("\n".join(lines)[:2000], ephemeral=True)
 
 
 if __name__ == "__main__":
