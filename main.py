@@ -25,7 +25,7 @@ GUILD_ID = int(os.getenv("GUILD_ID"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-GEMINI_MODEL = "gemini-3.6-flash-lite"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 # Modèle Claude utilisé pour les analyses de jeu (modifiable sans toucher au code via la variable CLAUDE_MODEL).
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
 
