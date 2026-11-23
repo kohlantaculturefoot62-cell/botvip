@@ -352,6 +352,14 @@ def make_member_resolver(guild: discord.Guild, aliases: dict[str, str] | None = 
     return resolve
 
 
+def roster_view(state: dict) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+    """(listes, joueurs) restreints aux candidats quand ils sont connus ; les données importées ne sont pas modifiées."""
+    roster = set(roster_ids(state))
+    lists = {o: {t: p for t, p in lst.items() if t in roster} for o, lst in state["lists"].items() if o in roster}
+    players = {pid: name for pid, name in state["players"].items() if pid in roster}
+    return lists, players
+
+
 def audit_lists(lists: dict[str, dict[str, str]], players: dict[str, str]) -> list[str]:
     """Contrôles de cohérence : listes complètes, quantités par pièce, répartition croisée, fiches manquantes."""
     warnings: list[str] = []
@@ -378,7 +386,7 @@ def audit_lists(lists: dict[str, dict[str, str]], players: dict[str, str]) -> li
     return warnings
 
 
-def parse_lists_payload(payload: dict, resolve) -> tuple[dict, dict, list[str]]:
+def parse_lists_payload(payload: dict, resolve, only_ids: set[str] | None = None) -> tuple[dict, dict, list[str]]:
     """
     Transforme {"Joueur": {"Autre": "Tour Saumon", ...}, ...} en (listes, joueurs, avertissements).
     Vérifie que chaque liste est complète et que la répartition des pièces respecte les quantités du jeu.
@@ -424,6 +432,14 @@ def parse_lists_payload(payload: dict, resolve) -> tuple[dict, dict, list[str]]:
             owner_list[target[0]] = piece
             players.setdefault(target[0], target[1])
         lists[owner[0]] = owner_list
+
+    # Si les candidats sont connus (salons itw), les autres personnes citées dans le salon des fiches sont ignorées.
+    if only_ids:
+        ignored = [name for pid, name in players.items() if pid not in only_ids]
+        lists = {o: {t: p for t, p in lst.items() if t in only_ids} for o, lst in lists.items() if o in only_ids}
+        players = {pid: name for pid, name in players.items() if pid in only_ids}
+        if ignored:
+            warnings.append(f"Ignoré(s), hors candidats des salons itw : {', '.join(ignored)}")
 
     warnings.extend(audit_lists(lists, players))
 
@@ -910,7 +926,7 @@ def store_imported_lists(guild: discord.Guild, payload: dict, extra_warnings: li
     """Résout les noms en membres, vérifie la cohérence, enregistre les listes et renvoie le message de compte rendu."""
     state = load_lc_state()
     resolve = make_member_resolver(guild, state["aliases"])
-    lists, players, warnings = parse_lists_payload(payload, resolve)
+    lists, players, warnings = parse_lists_payload(payload, resolve, set(state["candidates"]) or None)
     warnings = list(dict.fromkeys((extra_warnings or []) + warnings))
 
     if not lists:
@@ -1800,8 +1816,9 @@ async def lc_verifier(interaction: discord.Interaction):
     if not state["lists"]:
         await interaction.followup.send("Aucune liste importée : utilise /lc_importer_salon.", ephemeral=True)
         return
-    issues = audit_lists(state["lists"], state["players"])
-    head = f"{len(state['lists'])} liste(s) pour {len(state['players'])} joueur(s) détecté(s)."
+    lists, players = roster_view(state)
+    issues = audit_lists(lists, players)
+    head = f"{len(lists)} liste(s) pour {len(players)} joueur(s)" + (" (candidats des salons itw)." if state["candidates"] else " détecté(s) : lance /lc_candidats pour restreindre aux candidats des salons itw.")
     if issues:
         await send_long(interaction, f"{head}\n⚠️ {len(issues)} problème(s) :\n" + "\n".join(f"- {i}" for i in issues))
     else:
@@ -1987,7 +2004,7 @@ async def lc_candidats(interaction: discord.Interaction, appliquer: bool = False
         else:
             state["candidates"] = found
             save_lc_state(state)
-            lines.append(f"\n✅ Candidats enregistrés : les analyses ne portent plus que sur ces {len(found)} joueurs.")
+            lines.append(f"\n✅ Candidats enregistrés : les analyses ne portent plus que sur ces {len(found)} joueurs. Relance /lc_importer_salon pour que les fiches des autres personnes soient ignorées, puis /lc_verifier.")
     else:
         lines.append("\nRelance avec `appliquer:True` pour enregistrer cette liste comme liste officielle des candidats.")
     await send_long(interaction, "\n".join(lines))
