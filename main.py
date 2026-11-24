@@ -2211,7 +2211,7 @@ async def lc_verifier(interaction: discord.Interaction):
 
 # ---------- Law and Chaos : analyses (staff) ----------
 
-@bot.tree.command(name="lc_resume", description="[Staff] Journal des dernières heures : dynamiques, discussions clés, power ranking, alliances, bêtisier")
+@bot.tree.command(name="lc_resume", description="[Staff] Journal : dynamiques, discussions clés, power ranking, alliances, bêtisier")
 @app_commands.describe(
     heures="Fenêtre analysée en heures (1 à 72, défaut 24)",
     moteur="Qui rédige l'analyse (les vocaux sont toujours transcrits par Gemini) : Claude (défaut) ou Gemini",
