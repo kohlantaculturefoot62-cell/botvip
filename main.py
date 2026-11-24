@@ -27,12 +27,16 @@ GUILD_ID = int(os.getenv("GUILD_ID"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-GEMINI_MODEL = "gemini-3.5-flash"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 # Modèle Claude utilisé pour les analyses de jeu (modifiable sans toucher au code via la variable CLAUDE_MODEL).
 # Haiku 5.5 : environ 20 fois moins cher que Sonnet 5.5 (0,10 $ / 0,50 $ par million de tokens tant que le prompt reste sous 100 000 tokens).
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5")
 # Plafond de sortie des longues analyses (journal, histoires, fiches). L'API impose un maximum : on met très haut, seuls les tokens générés sont facturés.
 CLAUDE_MAX_OUTPUT = int(os.getenv("CLAUDE_MAX_OUTPUT", "64000"))
+# Qui fait TOUTES les analyses (journal, histoires, fiches, pronostic, classement, phrases d'interview…) : "gemini" (défaut) ou "claude".
+AI_PROVIDER = os.getenv("AI_PROVIDER", "gemini").strip().lower()
+GEMINI_ANALYSIS_MODEL = os.getenv("GEMINI_ANALYSIS_MODEL", "gemini-3.5-flash")
+GEMINI_MAX_OUTPUT = int(os.getenv("GEMINI_MAX_OUTPUT", "60000"))
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
@@ -42,6 +46,7 @@ claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 MODEL_PRICES = {
     "claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.00, 10.00), "claude-opus-5-5": (4.00, 20.00),
     "gemini-3.5-flash-lite": (0.30, 2.50),
+    "gemini-3.5-flash": (1.50, 9.00),
 }
 usage_totals: dict[str, dict] = {}   # {modèle: {"calls", "in", "out", "cost"}}
 usage_log: list[str] = []            # dernières lignes (appelant, tokens, coût estimé)
@@ -687,7 +692,7 @@ CONSIGNES :
 - Écris en français, de façon directe."""
 
 
-async def ask_claude(system: str, user: str, max_tokens: int = 4000) -> str:
+async def ask_claude_api(system: str, user: str, max_tokens: int = 4000, caller: str = "?") -> str:
     """Envoie un prompt à Claude (en streaming) et renvoie le texte complet de la réponse."""
     text, stop_reason, kinds, grown = "", None, [], False
     for attempt in range(4):
@@ -712,7 +717,7 @@ async def ask_claude(system: str, user: str, max_tokens: int = 4000) -> str:
         usage = getattr(response, "usage", None)
         if usage is not None:
             record_usage(CLAUDE_MODEL, getattr(usage, "input_tokens", 0) or 0, getattr(usage, "output_tokens", 0) or 0,
-                         sys._getframe(1).f_code.co_name, f"stop={stop_reason}, plafond={max_tokens}")
+                         caller, f"stop={stop_reason}, plafond={max_tokens}")
         kinds = [getattr(block, "type", "?") for block in response.content]
 
         if stop_reason == "max_tokens" and not grown:
@@ -728,6 +733,57 @@ async def ask_claude(system: str, user: str, max_tokens: int = 4000) -> str:
     if text:
         return text
     raise ValueError(f"Claude a renvoyé une réponse vide (stop_reason={stop_reason}, blocs={kinds}).")
+
+
+async def ask_gemini_api(system: str, user: str, max_tokens: int = 4000, caller: str = "?") -> str:
+    """Envoie un prompt à Gemini (modèle d'analyse) et renvoie le texte complet de la réponse."""
+    # La réflexion de Gemini compte dans la limite de sortie : les petites tâches reçoivent une marge pour ne pas rester sans texte.
+    cap = min(max_tokens if max_tokens >= 16000 else max(max_tokens * 5, 8000), GEMINI_MAX_OUTPUT)
+    text, finish = "", ""
+    for attempt in range(4):
+        try:
+            response = await _raw_generate_content(
+                model=GEMINI_ANALYSIS_MODEL,
+                contents=user,
+                config=types.GenerateContentConfig(system_instruction=system, max_output_tokens=cap),
+            )
+        except Exception as e:
+            if attempt < 3 and cap > 8000 and any(k in str(e).lower() for k in ("max_output_tokens", "maxoutputtokens", "output token")):
+                print(f"[gemini] plafond de sortie refusé ({cap}) : {e}. Nouvel essai avec {cap // 2}.")
+                cap //= 2
+                continue
+            if attempt < 3 and any(code in str(e) for code in ("503", "429", "500", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "DEADLINE")):
+                print(f"[gemini] erreur temporaire ({e}), nouvel essai dans 5 s.")
+                await asyncio.sleep(5)
+                continue
+            raise
+        meta = getattr(response, "usage_metadata", None)
+        if meta is not None:
+            record_usage(GEMINI_ANALYSIS_MODEL, getattr(meta, "prompt_token_count", 0) or 0,
+                         (getattr(meta, "candidates_token_count", 0) or 0) + (getattr(meta, "thoughts_token_count", 0) or 0),
+                         caller, f"plafond={cap}")
+        try:
+            text = (response.text or "").strip()
+        except Exception:  # réponse bloquée : .text lève une exception selon la version du SDK
+            text = ""
+        candidates = getattr(response, "candidates", None) or []
+        finish = str(getattr(candidates[0], "finish_reason", "")) if candidates else ""
+        if "MAX_TOKENS" in finish.upper() and cap < GEMINI_MAX_OUTPUT and attempt < 3:
+            print(f"Réponse Gemini tronquée (texte={len(text)} car., plafond={cap}) : nouvel essai avec plus de marge.")
+            cap = min(cap * 2, GEMINI_MAX_OUTPUT)
+            continue
+        break
+    if not text:
+        raise ValueError(f"Gemini a renvoyé une réponse vide (finish_reason={finish or '?'}).")
+    return text
+
+
+async def ask_claude(system: str, user: str, max_tokens: int = 4000, provider: Optional[str] = None) -> str:
+    """Point d'entrée unique des analyses : Gemini (défaut, variable AI_PROVIDER) ou Claude. Le nom est historique."""
+    caller = sys._getframe(1).f_code.co_name
+    if (provider or AI_PROVIDER) == "claude":
+        return await ask_claude_api(system, user, max_tokens, caller)
+    return await ask_gemini_api(system, user, max_tokens, caller)
 
 
 def extract_json_objects(text: str) -> list[dict]:
@@ -753,7 +809,7 @@ def extract_json(text: str) -> dict:
     """Extrait le premier objet JSON d'une réponse."""
     objects = extract_json_objects(text)
     if not objects:
-        raise ValueError("Aucun JSON exploitable dans la réponse de Claude.")
+        raise ValueError("Aucun JSON exploitable dans la réponse de l'IA.")
     return objects[0]
 
 
@@ -877,7 +933,7 @@ def find_json_with_key(text: str, key: str) -> dict:
             return obj
     if objects:
         return objects[0]
-    raise ValueError("Aucun JSON exploitable dans la réponse de Claude.")
+    raise ValueError("Aucun JSON exploitable dans la réponse de l'IA.")
 
 
 def build_state_brief(state: dict) -> str:
@@ -1095,9 +1151,9 @@ STORIES_PER_DAY = 3
 STORY_PLAYER_ROLE_ID = int(os.getenv("STORY_PLAYER_ROLE_ID", "1562019395453321327"))   # rôle @Joueur : seuls ceux qui l'ont encore sont tirés au sort
 STORY_MIN_MESSAGES = 3           # un candidat doit avoir écrit au moins ça sur 24 h pour être tiré au sort
 STORY_HISTORY_FILE = Path("story_history.json")
+SUIVI_CANDIDAT_CHANNEL_ID = int(os.getenv("SUIVI_CANDIDAT_CHANNEL_ID", "0") or 0)   # optionnel : sinon le salon est retrouvé par son nom « suivi-candidat »
 CANDIDAT_COOLDOWN = 45           # secondes entre deux /candidat d'une même personne
 CANDIDAT_CACHE_TTL = 3 * 3600    # une fiche candidat est gardée 3 h
-GEMINI_ANALYSIS_MODEL = os.getenv("GEMINI_ANALYSIS_MODEL", GEMINI_MODEL)  # utilisé seulement avec moteur:gemini
 JOURS_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
 MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
 
@@ -1447,9 +1503,10 @@ async def collect_journal_material(guild: discord.Guild, hours: int, state: dict
 
 # ---------- Journal ----------
 
-async def analyze_summary(guild: discord.Guild, hours: int, engine: str = "claude", public: bool = False) -> tuple[str, dict]:
+async def analyze_summary(guild: discord.Guild, hours: int, engine: Optional[str] = None, public: bool = False) -> tuple[str, dict]:
     """Journal des dernières heures : Gemini transcrit les vocaux, puis Claude (ou Gemini) rédige. Renvoie (texte, infos).
     public=True : les citations introuvables perdent leurs guillemets au lieu d'être marquées ⚠️."""
+    engine = engine or AI_PROVIDER
     state = load_lc_state()
     material = await collect_journal_material(guild, hours, state)
     if material["messages"] == 0:
@@ -1488,13 +1545,7 @@ MESSAGES (du plus ancien au plus récent dans chaque salon ; les heures sont cel
 
 {JOURNAL_FORMAT.replace('{hours}', str(hours))}"""
 
-    if engine == "gemini":
-        response = await ai_client.aio.models.generate_content(model=GEMINI_ANALYSIS_MODEL, contents=LC_SYSTEM + "\n\n" + prompt)
-        answer = (response.text or "").strip()
-        if not answer:
-            raise ValueError("Gemini n'a renvoyé aucun journal.")
-    else:
-        answer = await ask_claude(LC_SYSTEM, prompt, max_tokens=CLAUDE_MAX_OUTPUT)
+    answer = await ask_claude(LC_SYSTEM, prompt, max_tokens=CLAUDE_MAX_OUTPUT, provider=engine)  # plafond : seuls les tokens réellement générés sont facturés
 
     answer, quotes_total, quotes_bad = verify_quotes(answer, material["source_norm"], "strip" if public else "flag")
     print(f"[journal] {material['messages']} messages, {material['voices_transcribed']}/{material['voices']} vocaux, citations {quotes_total - quotes_bad}/{quotes_total} vérifiées ({engine}).")
@@ -1721,6 +1772,18 @@ async def publish_daily_stories(guild: discord.Guild, channel: discord.abc.Messa
 
 # ---------- Fiche d'un candidat (/candidat) ----------
 
+def find_suivi_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    """Salon où sont publiées les fiches : SUIVI_CANDIDAT_CHANNEL_ID, sinon un salon dont le nom contient « suivi-candidat »
+    (emojis et séparateurs ignorés)."""
+    if SUIVI_CANDIDAT_CHANNEL_ID:
+        channel = guild.get_channel(SUIVI_CANDIDAT_CHANNEL_ID)
+        if channel is not None:
+            return channel
+    wanted = nettoyer_texte("suivi-candidat")
+    matches = [c for c in guild.text_channels if wanted in nettoyer_texte(c.name)]
+    return matches[0] if matches else None
+
+
 def resolve_player_ref(state: dict, ref: str) -> Optional[str]:
     """Identifiant d'un joueur d'après un id ou un nom saisi (accents et casse ignorés), ou None si ambigu / inconnu."""
     names = state["players"]
@@ -1810,7 +1873,7 @@ def candidat_embed(result: dict) -> discord.Embed:
     if result["citations"]:
         text = "\n".join(f"« {c['texte']} »" + (f" *({c['contexte']})*" if c["contexte"] else "") for c in result["citations"])
         embed.add_field(name="💬 Il/elle a dit", value=text[:1024], inline=False)
-    embed.set_footer(text=f"Résumé généré par Claude • {result['messages']} messages de {result['name']} sur {result['days']} j")
+    embed.set_footer(text=f"Résumé généré par IA • {result['messages']} messages de {result['name']} sur {result['days']} j")
     return embed
 
 
@@ -1819,7 +1882,7 @@ def candidat_embed(result: dict) -> discord.Embed:
 DAILY_PUBLISH_TIME = dtime(hour=23, minute=30, tzinfo=PARIS_TZ)
 
 
-async def publish_daily_journal(guild: discord.Guild, channel: discord.abc.Messageable, hours: int = 24, engine: str = "claude") -> None:
+async def publish_daily_journal(guild: discord.Guild, channel: discord.abc.Messageable, hours: int = 24, engine: Optional[str] = None) -> None:
     result, info = await analyze_summary(guild, hours, engine, public=True)
     mentions = discord.AllowedMentions.none()
     await send_embeds(lambda **kw: channel.send(allowed_mentions=mentions, **kw), journal_embeds(result, info, hours))
@@ -1943,7 +2006,7 @@ Réponds UNIQUEMENT par un JSON valide, sans texte autour :
     )
     not_rated = [names[p] for p in alive if p not in items]
     if not_rated:
-        header += f"\n⚠️ Non évalués par Claude (notes neutres de 50 pour alliance et risque) : {', '.join(not_rated)}"
+        header += f"\n⚠️ Non évalués par l'IA (notes neutres de 50 pour alliance et risque) : {', '.join(not_rated)}"
     comments = "\n".join(f"**{rank}. {names[pid]}** — {comment}" for rank, (_, pid, _, _, _, comment) in enumerate(rows, 1))
     return header, comments
 
@@ -2133,7 +2196,7 @@ Réponds UNIQUEMENT par un JSON valide, sans texte autour :
     if unranked:
         print(f"[pronostic] {len(ranked)}/{len(alive)} joueurs classés. Réponse brute : {answer[:800]}")
         if public:
-            raise ValueError("Claude n'a pas classé tous les joueurs : rien n'a été publié. Relance la commande.")
+            raise ValueError("L'IA n'a pas classé tous les joueurs : rien n'a été publié. Relance la commande.")
 
     lines = [f"**🔮 Pronostic des éliminations** — {len(alive)} joueurs en vie, du prochain éliminé au vainqueur"]
     for idx, (pid, item) in enumerate(ranked, 1):
@@ -2141,15 +2204,15 @@ Réponds UNIQUEMENT par un JSON valide, sans texte autour :
         confiance = f" *(confiance {item['confiance']})*" if item.get("confiance") in ("faible", "moyenne", "forte") else ""
         lines.append(f"{icon} **{names[pid]}** — {item.get('raison', '—')}{confiance}")
     if unranked:
-        lines.append(f"\n⚠️ Non classés par Claude : {', '.join(names[p] for p in unranked)}. Relance la commande.")
+        lines.append(f"\n⚠️ Non classés par l'IA : {', '.join(names[p] for p in unranked)}. Relance la commande.")
     if data.get("lecture"):
         lines.append(f"\n💬 {data['lecture']}")
     if public:
-        lines.append("\n*Pronostic généré par Claude d'après la personnalité et le jeu de chacun. Pour le fun : rien n'est écrit d'avance !*")
+        lines.append("\n*Pronostic généré par IA d'après la personnalité et le jeu de chacun. Pour le fun : rien n'est écrit d'avance !*")
     else:
         if not interviews:
             lines.append("\nℹ️ Aucune interview trouvée (catégorie ITW_CATEGORY_ID) : le pronostic repose seulement sur les listes.")
-        lines.append("\n*Estimation de Claude d'après les listes, le barème des pièces et les interviews : aucune certitude.*")
+        lines.append("\n*Estimation de l'IA d'après les listes, le barème des pièces et les interviews : aucune certitude.*")
     return "\n".join(lines)
 
 
@@ -2225,7 +2288,7 @@ CONTENU DU SALON D'INTERVIEWS (il peut contenir les interviews de plusieurs joue
         raise ValueError("Aucune interview de ce joueur trouvée dans les messages analysés.")
     lines = [l for l in answer.strip().splitlines() if l.strip()]
     if not lines:
-        raise ValueError("Claude n'a renvoyé aucune phrase.")
+        raise ValueError("L'IA n'a renvoyé aucune phrase.")
     return lines[0].strip().strip('"«»“” ')[:300]
 
 
@@ -2466,7 +2529,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.event
 async def on_ready():
     print(f"Bot connecté en tant que : {bot.user.name} ({bot.user.id})")
-    print(f"Modèles : Claude = {CLAUDE_MODEL} (CLAUDE_MODEL {'définie' if os.getenv('CLAUDE_MODEL') else 'non définie : défaut du code'}), Gemini = {GEMINI_MODEL}")
+    print(f"Analyses : {AI_PROVIDER} ({GEMINI_ANALYSIS_MODEL if AI_PROVIDER != 'claude' else CLAUDE_MODEL}) • Gemini léger : {GEMINI_MODEL}")
 
     bot.add_view(VoiceSummaryView())
 
@@ -2747,10 +2810,10 @@ async def lc_verifier(interaction: discord.Interaction):
 @bot.tree.command(name="lc_resume", description="[Staff] Journal des dernières heures, raconté pour les spectateurs")
 @app_commands.describe(
     heures="Fenêtre analysée en heures (1 à 72, défaut 24)",
-    moteur="Qui rédige l'analyse (les vocaux sont toujours transcrits par Gemini) : Claude (défaut) ou Gemini",
+    moteur="Qui rédige l'analyse (par défaut : le moteur configuré, Gemini Flash)",
     publier="Publie le journal dans le salon officiel du journal (sinon aperçu privé)",
 )
-@app_commands.choices(moteur=[app_commands.Choice(name="Claude (recommandé)", value="claude"), app_commands.Choice(name="Gemini", value="gemini")])
+@app_commands.choices(moteur=[app_commands.Choice(name="Gemini Flash", value="gemini"), app_commands.Choice(name="Claude", value="claude")])
 @app_commands.guild_only()
 @staff_only()
 async def lc_resume(
@@ -2760,7 +2823,7 @@ async def lc_resume(
     publier: bool = False,
 ):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    engine = moteur.value if moteur else "claude"
+    engine = moteur.value if moteur else AI_PROVIDER
     try:
         result, info = await analyze_summary(interaction.guild, heures, engine, public=publier)
         embeds = journal_embeds(result, info, heures)
@@ -2837,7 +2900,7 @@ async def lc_histoires(interaction: discord.Interaction, joueur: Optional[str] =
         await interaction.followup.send(str(e), ephemeral=True)
     except Exception as e:
         print(f"Erreur /lc_histoires : {e}")
-        await interaction.followup.send("La génération a échoué (API Claude, lecture des salons). Regarde les logs.", ephemeral=True)
+        await interaction.followup.send("La génération a échoué (API IA, lecture des salons). Regarde les logs.", ephemeral=True)
 
 
 @bot.tree.command(name="candidat", description="Résumé du jeu d'un candidat : moments clés, relations, citations")
@@ -2848,13 +2911,19 @@ async def candidat(interaction: discord.Interaction, joueur: str, jours: app_com
     if not can_use_duo(interaction.user):  # spectateurs, admins et Juges Suprêmes
         await interaction.response.send_message("⛔ Réservé aux spectateurs et aux orgas.", ephemeral=True)
         return
+    suivi = find_suivi_channel(interaction.guild)
+    if suivi is None:
+        await interaction.response.send_message("Je ne trouve pas le salon « suivi-candidat » : prévenez un orga.", ephemeral=True)
+        return
     now = asyncio.get_event_loop().time()
     if now - candidat_last_call.get(interaction.user.id, 0) < CANDIDAT_COOLDOWN:
         await interaction.response.send_message("⏳ Doucement, réessaie dans quelques secondes.", ephemeral=True)
         return
     candidat_last_call[interaction.user.id] = now
 
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    # Lancée dans suivi-candidat : la fiche s'y affiche directement (publique). Ailleurs : réponse privée + publication dans suivi-candidat.
+    here = interaction.channel_id == suivi.id
+    await interaction.response.defer(ephemeral=not here, thinking=True)
     state = load_lc_state()
     pid = resolve_player_ref(state, joueur)
     if pid is None:
@@ -2869,7 +2938,18 @@ async def candidat(interaction: discord.Interaction, joueur: str, jours: app_com
         print(f"Erreur /candidat : {e}")
         await interaction.followup.send("Je n'ai pas réussi à préparer cette fiche, réessaie dans un instant.", ephemeral=True)
         return
-    await interaction.followup.send(embed=candidat_embed(result), ephemeral=True)
+
+    tag = discord.AllowedMentions(users=[interaction.user], roles=False, everyone=False)
+    content = f"🔎 Fiche demandée par {interaction.user.mention}"
+    if here:
+        await interaction.followup.send(content=content, embed=candidat_embed(result), allowed_mentions=tag)
+        return
+    try:
+        post = await suivi.send(content=content, embed=candidat_embed(result), allowed_mentions=tag)
+    except discord.Forbidden:
+        await interaction.followup.send(f"Je n'ai pas le droit d'écrire dans {suivi.mention} : prévenez un orga.", ephemeral=True)
+        return
+    await interaction.followup.send(f"✅ Fiche de **{result['name']}** publiée dans {suivi.mention} : {post.jump_url}", ephemeral=True)
 
 
 @bot.tree.command(name="lc_classement", description="[Staff] Classe les joueurs : alliances, pièces restantes, risque d'être ciblé")
@@ -2882,7 +2962,7 @@ async def lc_classement(interaction: discord.Interaction, heures: app_commands.R
         header, comments = await analyze_ranking(interaction.guild, heures)
     except Exception as e:
         print(f"Erreur /lc_classement : {e}")
-        await interaction.followup.send("L'analyse a échoué (API Claude, JSON invalide ou lecture des salons). Réessaie ou regarde les logs.", ephemeral=True)
+        await interaction.followup.send("L'analyse a échoué (API IA, JSON invalide ou lecture des salons). Réessaie ou regarde les logs.", ephemeral=True)
         return
     await send_long(interaction, header)
     if comments:
@@ -2899,7 +2979,7 @@ async def lc_beneficiaires(interaction: discord.Interaction, heures: app_command
         result = await analyze_beneficiaries(interaction.guild, heures)
     except Exception as e:
         print(f"Erreur /lc_beneficiaires : {e}")
-        await interaction.followup.send("L'analyse a échoué (API Claude, JSON invalide ou lecture des salons). Réessaie ou regarde les logs.", ephemeral=True)
+        await interaction.followup.send("L'analyse a échoué (API IA, JSON invalide ou lecture des salons). Réessaie ou regarde les logs.", ephemeral=True)
         return
     await send_long(interaction, result)
 
@@ -2919,7 +2999,7 @@ async def lc_phrase_itw(interaction: discord.Interaction, joueur: discord.Member
         return
     except Exception as e:
         print(f"Erreur /lc_phrase_itw : {e}")
-        await interaction.followup.send("La génération a échoué (API Claude ou lecture du salon). Regarde les logs.", ephemeral=True)
+        await interaction.followup.send("La génération a échoué (API IA ou lecture du salon). Regarde les logs.", ephemeral=True)
         return
 
     text = f"🎤 **{joueur.display_name}** — *{line}*"
@@ -2979,7 +3059,7 @@ async def lc_phrases_itw_tous(interaction: discord.Interaction, messages: app_co
 @app_commands.describe(
     messages="Derniers messages lus par salon d'interview (défaut 300)",
     heures="Ajoute aussi les conversations des X dernières heures (0 = non, défaut)",
-    publier="Publie le pronostic directement dans ce salon (par défaut : salon orga, Claude utilise tout)",
+    publier="Publie le pronostic directement dans ce salon (par défaut : salon orga, l'IA utilise tout)",
     salon_joueurs="Avec publier : le salon est vu des joueurs, donc aucune info secrète sur les listes",
 )
 @app_commands.guild_only()
@@ -3003,7 +3083,7 @@ async def lc_pronostic(
         return
     except Exception as e:
         print(f"Erreur /lc_pronostic : {e}")
-        await interaction.followup.send("Le pronostic a échoué (API Claude, JSON invalide ou lecture des salons). Réessaie ou regarde les logs.", ephemeral=True)
+        await interaction.followup.send("Le pronostic a échoué (API IA, JSON invalide ou lecture des salons). Réessaie ou regarde les logs.", ephemeral=True)
         return
 
     if publier:
@@ -3478,9 +3558,8 @@ async def lc_cout(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     lines = [
         "**🤖 Modèles utilisés en ce moment**",
-        f"• Claude (journal, histoires, /candidat, pronostic, classement…) : `{CLAUDE_MODEL}`" + ("" if os.getenv("CLAUDE_MODEL") else " *(défaut du code : variable CLAUDE_MODEL non définie)*"),
-        f"• Gemini (vocaux, traduction, fiches, duos) : `{GEMINI_MODEL}`",
-        f"• Gemini pour l'analyse si `moteur:Gemini` : `{GEMINI_ANALYSIS_MODEL}`",
+        f"• **Analyses** (journal, histoires, /candidat, pronostic, classement, phrases d'interview) : `{GEMINI_ANALYSIS_MODEL if AI_PROVIDER != 'claude' else CLAUDE_MODEL}` via **{'Gemini' if AI_PROVIDER != 'claude' else 'Claude'}** *(variable AI_PROVIDER = `{AI_PROVIDER}`)*",
+        f"• Vocaux, traduction, fiches, duos (Gemini léger) : `{GEMINI_MODEL}`",
         "",
         "**💸 Consommation d'API depuis le dernier redémarrage** *(estimation d'après les tokens renvoyés par les API)*",
     ]
