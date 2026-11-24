@@ -2466,6 +2466,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.event
 async def on_ready():
     print(f"Bot connecté en tant que : {bot.user.name} ({bot.user.id})")
+    print(f"Modèles : Claude = {CLAUDE_MODEL} (CLAUDE_MODEL {'définie' if os.getenv('CLAUDE_MODEL') else 'non définie : défaut du code'}), Gemini = {GEMINI_MODEL}")
 
     bot.add_view(VoiceSummaryView())
 
@@ -3475,7 +3476,14 @@ async def duo_rafraichir(interaction: discord.Interaction):
 @staff_only()
 async def lc_cout(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    lines = ["**💸 Consommation d'API depuis le dernier redémarrage** *(estimation d'après les tokens renvoyés par les API)*"]
+    lines = [
+        "**🤖 Modèles utilisés en ce moment**",
+        f"• Claude (journal, histoires, /candidat, pronostic, classement…) : `{CLAUDE_MODEL}`" + ("" if os.getenv("CLAUDE_MODEL") else " *(défaut du code : variable CLAUDE_MODEL non définie)*"),
+        f"• Gemini (vocaux, traduction, fiches, duos) : `{GEMINI_MODEL}`",
+        f"• Gemini pour l'analyse si `moteur:Gemini` : `{GEMINI_ANALYSIS_MODEL}`",
+        "",
+        "**💸 Consommation d'API depuis le dernier redémarrage** *(estimation d'après les tokens renvoyés par les API)*",
+    ]
     if not usage_totals:
         lines.append("Aucun appel pour l'instant.")
     total = 0.0
