@@ -27,7 +27,7 @@ GUILD_ID = int(os.getenv("GUILD_ID"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_MODEL = "gemini-3.5-flash"
 # Modèle Claude utilisé pour les analyses de jeu (modifiable sans toucher au code via la variable CLAUDE_MODEL).
 # Haiku 5.5 : environ 20 fois moins cher que Sonnet 5.5 (0,10 $ / 0,50 $ par million de tokens tant que le prompt reste sous 100 000 tokens).
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5")
