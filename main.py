@@ -2781,6 +2781,25 @@ async def lc_nominer(interaction: discord.Interaction, joueur: discord.Member):
     await interaction.response.send_message(f"{joueur.display_name} {action}.\nNominés actuels : {current}", ephemeral=True)
 
 
+@bot.tree.command(name="lc_nominer_tous", description="[Staff] Nomine tous les joueurs en vie pour le tour actuel")
+@app_commands.describe(retirer="Vide la liste des nominés au lieu de nominer tout le monde")
+@app_commands.guild_only()
+@staff_only()
+async def lc_nominer_tous(interaction: discord.Interaction, retirer: bool = False):
+    state = load_lc_state()
+    alive = alive_ids(state)
+    if not alive:
+        await interaction.response.send_message("Aucun joueur en vie dans l'état du jeu : vérifie /lc_etat.", ephemeral=True)
+        return
+    state["nominees"] = [] if retirer else list(alive)
+    save_lc_state(state)
+    if retirer:
+        text = f"↩️ Nominés vidés pour le tour {state['round']}."
+    else:
+        text = f"✅ Les {len(alive)} joueurs en vie sont nominés pour le tour {state['round']} :\n" + ", ".join(state["players"][p] for p in alive)
+    await interaction.response.send_message(text[:2000], ephemeral=True)
+
+
 def channel_is_staff_only(guild: discord.Guild, channel: discord.abc.GuildChannel, state: dict) -> tuple[bool, str]:
     """True si ni @everyone, ni les Spectateurs, ni aucun joueur de la partie ne peut voir le salon."""
     role_spec = discord.utils.get(guild.roles, name=ROLE_SPECTATEURS_NAME)
