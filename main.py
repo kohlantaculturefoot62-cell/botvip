@@ -628,12 +628,14 @@ CONSIGNES :
 async def ask_claude(system: str, user: str, max_tokens: int = 4000) -> str:
     """Envoie un prompt à Claude et renvoie le texte de la réponse."""
     for attempt in range(2):
-        response = await claude_client.messages.create(
+        # Streaming : obligatoire pour les grosses limites de sortie (le SDK refuse les longues requêtes non streamées).
+        async with claude_client.messages.stream(
             model=CLAUDE_MODEL,
             max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": user}],
-        )
+        ) as stream:
+            response = await stream.get_final_message()
         text = "".join(block.text for block in response.content if getattr(block, "type", "") == "text").strip()
         if text:
             return text
@@ -641,7 +643,7 @@ async def ask_claude(system: str, user: str, max_tokens: int = 4000) -> str:
         kinds = [getattr(block, "type", "?") for block in response.content]
         print(f"Réponse Claude vide : stop_reason={response.stop_reason}, blocs={kinds}, max_tokens={max_tokens}, modèle={CLAUDE_MODEL}")
         if response.stop_reason == "max_tokens" and attempt == 0:
-            max_tokens *= 4  # le budget a été consommé avant d'écrire du texte : on réessaie une fois avec plus de marge
+            max_tokens = min(max_tokens * 4, 64000)  # la réflexion a consommé tout le budget avant le texte : on réessaie avec plus de marge
             continue
         break
     raise ValueError(f"Claude a renvoyé une réponse vide (stop_reason={response.stop_reason}, blocs={kinds}).")
@@ -1321,7 +1323,7 @@ MESSAGES (du plus ancien au plus récent dans chaque salon) :
         if not answer:
             raise ValueError("Gemini n'a renvoyé aucun journal.")
     else:
-        answer = await ask_claude(LC_SYSTEM, prompt, max_tokens=9000)
+        answer = await ask_claude(LC_SYSTEM, prompt, max_tokens=32000)  # plafond : seuls les tokens réellement générés sont facturés
 
     answer, quotes_total, quotes_bad = verify_quotes(answer, material["source_norm"])
     print(f"[journal] {material['messages']} messages, {material['voices_transcribed']}/{material['voices']} vocaux, citations {quotes_total - quotes_bad}/{quotes_total} vérifiées ({engine}).")
