@@ -2454,10 +2454,13 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     else:
         print(f"Erreur commande /{interaction.command.name if interaction.command else '?'} : {error}")
         message = "Une erreur est survenue pendant l'exécution de la commande."
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.NotFound:
+        pass  # l'interaction a expiré (plus de 3 s sans réponse) : rien à envoyer, l'erreur est déjà dans les logs
 
 
 @bot.event
@@ -3218,6 +3221,7 @@ async def eliminer_candidat(interaction: discord.Interaction, role_candidat: dis
 
 DUO_INDEX_FILE = Path("duo_index.json")
 DUO_WINDOW_HOURS = 24            # fenêtre pour mesurer l'activité d'un duo
+DUO_MAX_QUEUE = 40               # on ne garde que les duos les PLUS actifs
 DUO_MIN_MESSAGES = 10            # en dessous, le duo n'est pas jugé intéressant
 DUO_REFRESH_MINUTES = 30         # fréquence du scan en arrière-plan (la lecture des salons ne coûte rien, les résumés Gemini si)
 DUO_RESUMMARIZE_AFTER = 12       # nouveaux messages avant de refaire le petit résumé d'un duo
@@ -3354,9 +3358,9 @@ async def refresh_duo_index(guild: discord.Guild) -> None:
         old = duo_index["duos"]
         new_duos: dict[str, dict] = {}
         to_summarize = []
-        for (channel, names), count in zip(duos, counts):
-            if count < DUO_MIN_MESSAGES:
-                continue
+        # Seuls les duos les plus actifs sont retenus (avant tout appel IA : on ne résume pas ce qui sera écarté).
+        active = sorted(((c, n, k) for (c, n), k in zip(duos, counts) if k >= DUO_MIN_MESSAGES), key=lambda t: t[2], reverse=True)[:DUO_MAX_QUEUE]
+        for channel, names, count in active:
             key = str(channel.id)
             prev = old.get(key, {})
             entry = {"names": names, "count": count, "summary": prev.get("summary"),
@@ -3470,6 +3474,7 @@ async def duo_rafraichir(interaction: discord.Interaction):
 @app_commands.guild_only()
 @staff_only()
 async def lc_cout(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
     lines = ["**💸 Consommation d'API depuis le dernier redémarrage** *(estimation d'après les tokens renvoyés par les API)*"]
     if not usage_totals:
         lines.append("Aucun appel pour l'instant.")
