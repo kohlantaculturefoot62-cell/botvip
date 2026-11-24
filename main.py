@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import unicodedata
 import asyncio
@@ -28,12 +29,71 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 # Modèle Claude utilisé pour les analyses de jeu (modifiable sans toucher au code via la variable CLAUDE_MODEL).
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+# Haiku 5.5 : environ 20 fois moins cher que Sonnet 5.5 (0,10 $ / 0,50 $ par million de tokens tant que le prompt reste sous 100 000 tokens).
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5")
 # Plafond de sortie des longues analyses (journal, histoires, fiches). L'API impose un maximum : on met très haut, seuls les tokens générés sont facturés.
 CLAUDE_MAX_OUTPUT = int(os.getenv("CLAUDE_MAX_OUTPUT", "64000"))
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 claude_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+# ---------- Suivi de la consommation d'API (depuis le dernier redémarrage) ----------
+# Tarifs indicatifs en $ par million de tokens : (entrée, sortie). Haiku 5.5 : tarif ×5 au-delà de 100 000 tokens de prompt.
+MODEL_PRICES = {
+    "claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.00, 10.00), "claude-opus-5-5": (4.00, 20.00),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
+}
+usage_totals: dict[str, dict] = {}   # {modèle: {"calls", "in", "out", "cost"}}
+usage_log: list[str] = []            # dernières lignes (appelant, tokens, coût estimé)
+
+
+def estimate_cost(model: str, tokens_in: int, tokens_out: int) -> Optional[float]:
+    price = MODEL_PRICES.get(model)
+    if price is None:
+        return None
+    p_in, p_out = price
+    if model == "claude-haiku-5-5" and tokens_in > 100_000:
+        p_in, p_out = 0.50, 2.50
+    return tokens_in / 1e6 * p_in + tokens_out / 1e6 * p_out
+
+
+def record_usage(model: str, tokens_in: int, tokens_out: int, caller: str, note: str = "") -> None:
+    cost = estimate_cost(model, tokens_in, tokens_out)
+    totals = usage_totals.setdefault(model, {"calls": 0, "in": 0, "out": 0, "cost": 0.0})
+    totals["calls"] += 1
+    totals["in"] += tokens_in
+    totals["out"] += tokens_out
+    totals["cost"] += cost or 0.0
+    line = f"{datetime.now(timezone.utc):%d/%m %H:%M} {caller} · {model} · {tokens_in} in / {tokens_out} out" + (f" ≈ {cost:.3f} $" if cost is not None else "") + (f" · {note}" if note else "")
+    usage_log.append(line)
+    del usage_log[:-40]
+    print(f"[coût] {line}")
+
+
+def track_gemini(response, caller: str = "gemini") -> None:
+    meta = getattr(response, "usage_metadata", None)
+    if meta is None:
+        return
+    tokens_in = getattr(meta, "prompt_token_count", 0) or 0
+    tokens_out = (getattr(meta, "candidates_token_count", 0) or 0) + (getattr(meta, "thoughts_token_count", 0) or 0)
+    model = getattr(response, "model_version", None) or GEMINI_MODEL
+    record_usage(GEMINI_MODEL if model not in MODEL_PRICES else model, tokens_in, tokens_out, caller)
+
+
+_raw_generate_content = ai_client.aio.models.generate_content
+
+
+async def _tracked_generate_content(*args, **kwargs):
+    """Même appel que d'habitude, mais le nombre de tokens consommés est enregistré (/lc_cout et logs)."""
+    response = await _raw_generate_content(*args, **kwargs)
+    try:
+        track_gemini(response, sys._getframe(1).f_code.co_name)
+    except Exception:
+        pass
+    return response
+
+
+ai_client.aio.models.generate_content = _tracked_generate_content
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -608,7 +668,7 @@ def format_player_list(state: dict, pid: str) -> str | None:
 # 5. LAW AND CHAOS — COLLECTE DES CONVERSATIONS ET APPELS À CLAUDE
 # ==============================================================================
 
-MAX_TRANSCRIPT_CHARS = 250_000
+MAX_TRANSCRIPT_CHARS = 180_000  # reste sous ~100 000 tokens : au-delà, Haiku 5.5 facture 5 fois plus cher
 MAX_MESSAGE_CHARS = 600
 
 LC_SYSTEM = f"""Tu es l'analyste des hosts de « Law and Chaos 3 », un jeu d'élimination sur Discord entre amis (22 joueurs au départ).
@@ -629,23 +689,36 @@ CONSIGNES :
 
 async def ask_claude(system: str, user: str, max_tokens: int = 4000) -> str:
     """Envoie un prompt à Claude (en streaming) et renvoie le texte complet de la réponse."""
-    text, stop_reason, kinds = "", None, []
-    for attempt in range(2):
-        # Streaming : obligatoire pour les grosses limites de sortie (le SDK refuse les longues requêtes non streamées).
-        async with claude_client.messages.stream(
-            model=CLAUDE_MODEL,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        ) as stream:
-            response = await stream.get_final_message()
+    text, stop_reason, kinds, grown = "", None, [], False
+    for attempt in range(4):
+        try:
+            # Streaming : obligatoire pour les grosses limites de sortie (le SDK refuse les longues requêtes non streamées).
+            async with claude_client.messages.stream(
+                model=CLAUDE_MODEL,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            ) as stream:
+                response = await stream.get_final_message()
+        except Exception as e:
+            # Plafond supérieur à ce que le modèle accepte : on le réduit de moitié et on réessaie.
+            if "max_tokens" in str(e).lower() and max_tokens > 8000 and attempt < 3:
+                print(f"Plafond de sortie refusé ({max_tokens}) par {CLAUDE_MODEL} : {e}. Nouvel essai avec {max_tokens // 2}.")
+                max_tokens //= 2
+                continue
+            raise
         text = "".join(block.text for block in response.content if getattr(block, "type", "") == "text").strip()
         stop_reason = response.stop_reason
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            record_usage(CLAUDE_MODEL, getattr(usage, "input_tokens", 0) or 0, getattr(usage, "output_tokens", 0) or 0,
+                         sys._getframe(1).f_code.co_name, f"stop={stop_reason}, plafond={max_tokens}")
         kinds = [getattr(block, "type", "?") for block in response.content]
 
-        if stop_reason == "max_tokens" and attempt == 0:
+        if stop_reason == "max_tokens" and not grown:
             # La réflexion a consommé le budget : la réponse est vide ou COUPÉE (ex. un journal arrêté après 2 sections).
             print(f"Réponse Claude tronquée : stop_reason=max_tokens, texte={len(text)} car., blocs={kinds}, max_tokens={max_tokens}, modèle={CLAUDE_MODEL}. Nouvel essai avec plus de marge.")
+            grown = True
             max_tokens = min(max_tokens * 3, CLAUDE_MAX_OUTPUT)
             continue
         if text:
@@ -3146,9 +3219,10 @@ async def eliminer_candidat(interaction: discord.Interaction, role_candidat: dis
 DUO_INDEX_FILE = Path("duo_index.json")
 DUO_WINDOW_HOURS = 24            # fenêtre pour mesurer l'activité d'un duo
 DUO_MIN_MESSAGES = 10            # en dessous, le duo n'est pas jugé intéressant
-DUO_REFRESH_MINUTES = 20         # fréquence du scan en arrière-plan
-DUO_RESUMMARIZE_AFTER = 6        # nouveaux messages avant de refaire le petit résumé d'un duo
-DUO_MAX_SUMMARIES_PER_RUN = 12   # borne le coût Gemini à chaque passage
+DUO_REFRESH_MINUTES = 30         # fréquence du scan en arrière-plan (la lecture des salons ne coûte rien, les résumés Gemini si)
+DUO_RESUMMARIZE_AFTER = 12       # nouveaux messages avant de refaire le petit résumé d'un duo
+DUO_RESUMMARIZE_MIN_HOURS = 4    # et au moins ce délai depuis son dernier résumé
+DUO_MAX_SUMMARIES_PER_RUN = 4    # borne le coût Gemini à chaque passage
 DUO_COOLDOWN = 5                 # secondes entre deux !duo d'une même personne
 DUO_REPLY_LIFETIME = 120         # le message du bot disparaît pour ne pas polluer le salon
 
@@ -3285,9 +3359,14 @@ async def refresh_duo_index(guild: discord.Guild) -> None:
                 continue
             key = str(channel.id)
             prev = old.get(key, {})
-            entry = {"names": names, "count": count, "summary": prev.get("summary"), "summarized_at_count": prev.get("summarized_at_count", 0)}
+            entry = {"names": names, "count": count, "summary": prev.get("summary"),
+                     "summarized_at_count": prev.get("summarized_at_count", 0), "summarized_at": prev.get("summarized_at")}
             new_duos[key] = entry
-            if entry["summary"] is None or count - entry["summarized_at_count"] >= DUO_RESUMMARIZE_AFTER or count < entry["summarized_at_count"]:
+            # Un résumé n'est refait que s'il y a vraiment du nouveau : assez de messages ET assez de temps depuis le dernier.
+            # (Le compteur est une fenêtre glissante de 24 h : qu'il baisse ne justifie pas un nouvel appel.)
+            last = datetime.fromisoformat(entry["summarized_at"]) if entry["summarized_at"] else None
+            old_enough = last is None or datetime.now(timezone.utc) - last >= timedelta(hours=DUO_RESUMMARIZE_MIN_HOURS)
+            if entry["summary"] is None or (old_enough and count - entry["summarized_at_count"] >= DUO_RESUMMARIZE_AFTER):
                 to_summarize.append((channel, entry))
 
         # Les plus actifs d'abord pour les résumés (budget limité par passage).
@@ -3301,6 +3380,7 @@ async def refresh_duo_index(guild: discord.Guild) -> None:
             if summary:
                 entry["summary"] = summary
                 entry["summarized_at_count"] = entry["count"]
+                entry["summarized_at"] = datetime.now(timezone.utc).isoformat()
             await asyncio.sleep(0.5)
 
         by_activity = sorted(new_duos, key=lambda k: new_duos[k]["count"], reverse=True)
@@ -3384,6 +3464,25 @@ async def duo_rafraichir(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     await refresh_duo_index(interaction.guild)
     await interaction.followup.send(f"✅ Index des duos mis à jour : {len(duo_index['queue'])} duo(s) dans la liste.", ephemeral=True)
+
+
+@bot.tree.command(name="lc_cout", description="[Staff] Consommation d'API estimée depuis le dernier redémarrage")
+@app_commands.guild_only()
+@staff_only()
+async def lc_cout(interaction: discord.Interaction):
+    lines = ["**💸 Consommation d'API depuis le dernier redémarrage** *(estimation d'après les tokens renvoyés par les API)*"]
+    if not usage_totals:
+        lines.append("Aucun appel pour l'instant.")
+    total = 0.0
+    for model, t in sorted(usage_totals.items(), key=lambda kv: -kv[1]["cost"]):
+        total += t["cost"]
+        priced = estimate_cost(model, 1, 1) is not None
+        lines.append(f"• **{model}** : {t['calls']} appel(s), {t['in']:,} tokens en entrée, {t['out']:,} en sortie" + (f" ≈ **{t['cost']:.2f} $**" if priced else " (tarif inconnu)"))
+    lines.append(f"**Total estimé : {total:.2f} $**")
+    if usage_log:
+        lines.append("\n**Derniers appels** (fonction · modèle · tokens) :")
+        lines.extend(f"`{l}`" for l in usage_log[-12:])
+    await send_long(interaction, "\n".join(lines))
 
 
 if __name__ == "__main__":
