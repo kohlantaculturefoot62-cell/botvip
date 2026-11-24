@@ -2781,18 +2781,23 @@ async def lc_nominer(interaction: discord.Interaction, joueur: discord.Member):
     await interaction.response.send_message(f"{joueur.display_name} {action}.\nNominés actuels : {current}", ephemeral=True)
 
 
-@bot.tree.command(name="lc_eliminer", description="[Staff] Enregistre l'élimination d'un joueur et affiche les effets déclenchés")
-@app_commands.describe(joueur="Joueur éliminé ce tour")
-@app_commands.guild_only()
-@staff_only()
-async def lc_eliminer(interaction: discord.Interaction, joueur: discord.Member):
-    await interaction.response.defer(ephemeral=True)
-    state = load_lc_state()
-    pid = str(joueur.id)
-    if pid not in alive_ids(state):
-        await interaction.followup.send(f"{joueur.display_name} n'est pas un joueur en vie.", ephemeral=True)
-        return
+def channel_is_staff_only(guild: discord.Guild, channel: discord.abc.GuildChannel, state: dict) -> tuple[bool, str]:
+    """True si ni @everyone, ni les Spectateurs, ni aucun joueur de la partie ne peut voir le salon."""
+    role_spec = discord.utils.get(guild.roles, name=ROLE_SPECTATEURS_NAME)
+    for role in (guild.default_role, role_spec):
+        if role is not None and channel.permissions_for(role).view_channel:
+            return False, f"le rôle {role.name} voit ce salon"
+    for pid, name in state["players"].items():
+        member = guild.get_member(int(pid)) if str(pid).isdigit() else None
+        if member is not None and channel.permissions_for(member).view_channel:
+            return False, f"le joueur {name} voit ce salon"
+    return True, ""
 
+
+def register_elimination(state: dict, pid: str) -> str:
+    """Enregistre l'élimination (tour +1, nominés recalculés) et renvoie le message des effets déclenchés.
+    Les Fous se souviennent des effets précédents : le Fou Saumon copie le dernier effet vécu par son propriétaire,
+    le Fou Caramel inverse la couleur de son prochain effet (voir compute_player_status / apply_effect)."""
     state["eliminations"].append({"round": state["round"], "player": pid, "at": datetime.now(timezone.utc).isoformat()})
     state["round"] += 1
     state["nominees"] = []
@@ -2806,7 +2811,16 @@ async def lc_eliminer(interaction: discord.Interaction, joueur: discord.Member):
         if not history or history[-1]["eliminated"] != pid:
             continue
         entry = history[-1]
-        lines.append(f"• {names[owner]} : {describe_effect(entry['piece'], entry['effect'])}")
+        line = f"• {names[owner]} : {describe_effect(entry['piece'], entry['effect'])}"
+        if len(history) >= 2 and entry["piece"] in ("fou_saumon", "fou_caramel"):
+            prev = history[-2]["effect"]
+            if prev:
+                line += f" *(effet précédent : {PIECES[prev]['label']})*"
+        if entry["piece"] == "fou_caramel":
+            line += " *(son prochain effet sera de couleur inversée)*"
+        elif status[owner]["pending_invert"] and entry["piece"] != "fou_caramel":
+            line += " *(Fou Caramel : son prochain effet sera inversé)*"
+        lines.append(line)
         if entry["effect"] in ("tour_saumon", "reine_saumon"):
             auto_nominees.append(owner)
         if entry["effect"] in ("tour_caramel", "reine_caramel"):
@@ -2814,14 +2828,37 @@ async def lc_eliminer(interaction: discord.Interaction, joueur: discord.Member):
 
     # Les joueurs nominés par leur effet le sont automatiquement ; les autres se rajoutent avec /lc_nominer.
     state["nominees"] = auto_nominees
-    save_lc_state(state)
-
-    text = f"✅ **{names.get(pid, joueur.display_name)}** éliminé(e). Tour {state['round']} :\n" + ("\n".join(lines) or "(listes non importées : aucun effet calculé)")
+    text = f"✅ **{names.get(pid, pid)}** éliminé(e). Tour {state['round']} :\n" + ("\n".join(lines) or "(aucun effet : listes non importées ou personne ne l'avait dans sa liste)")
     text += f"\n\n**Nominés par effet :** {', '.join(names[p] for p in auto_nominees) or 'aucun'}"
     if nominators:
         text += f"\n**Doivent nominer quelqu'un (à ajouter avec /lc_nominer) :** {', '.join(nominators)}"
     text += "\n*Rappel : le Roi Saumon (accusation) et l'immunité du Roi Caramel ne sont pas gérés automatiquement.*"
-    await send_long(interaction, text)
+    return text
+
+
+@bot.tree.command(name="lc_eliminer", description="[Staff] Enregistre l'élimination d'un joueur et affiche les effets déclenchés")
+@app_commands.describe(joueur="Joueur éliminé ce tour")
+@app_commands.guild_only()
+@staff_only()
+async def lc_eliminer(interaction: discord.Interaction, joueur: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    state = load_lc_state()
+    pid = str(joueur.id)
+    if pid not in alive_ids(state):
+        await interaction.followup.send(f"{joueur.display_name} n'est pas un joueur en vie.", ephemeral=True)
+        return
+
+    # Les effets sont écrits dans le salon où la commande est lancée, uniquement s'il est réservé aux orgas.
+    ok, reason = channel_is_staff_only(interaction.guild, interaction.channel, state)
+    if not ok:
+        await interaction.followup.send(f"🚫 Lance cette commande dans un salon réservé aux orgas : {reason}. Rien n'a été enregistré.", ephemeral=True)
+        return
+
+    text = register_elimination(state, pid)
+    save_lc_state(state)
+    for chunk in split_text(text):
+        await interaction.channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.followup.send("✅ Élimination enregistrée, effets affichés dans ce salon (annulable : /lc_annuler_derniere_elimination).", ephemeral=True)
 
 
 @bot.tree.command(name="lc_annuler_derniere_elimination", description="[Staff] Annule la dernière élimination enregistrée (en cas d'erreur)")
@@ -3438,6 +3475,7 @@ async def eliminer_candidat(interaction: discord.Interaction, role_candidat: dis
     if trimmed:
         lines.append(f"✂️ **{len(trimmed)} salon(s) à 4+ conservé(s)** (candidat retiré, groupe restant inédit) : {', '.join(c.mention for c in trimmed)}")
     lines.append("🔒 Le candidat n'a plus accès à ces salons.")
+
     await interaction.followup.send("\n".join(lines)[:2000], ephemeral=True)
 
 
